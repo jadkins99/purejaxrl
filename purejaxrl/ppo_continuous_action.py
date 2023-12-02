@@ -7,7 +7,8 @@ from flax.linen.initializers import constant, orthogonal
 from typing import Sequence, NamedTuple, Any
 from flax.training.train_state import TrainState
 import distrax
-from wrappers import (
+import gymnax
+from purejaxrl.wrappers import (
     LogWrapper,
     BraxGymnaxWrapper,
     VecEnv,
@@ -73,7 +74,11 @@ def make_train(config):
     config["MINIBATCH_SIZE"] = (
         config["NUM_ENVS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
     )
-    env, env_params = BraxGymnaxWrapper(config["ENV_NAME"]), None
+    if config["ENV_NAME"] == "Pendulum-v1":
+        env, env_params = gymnax.make(config["ENV_NAME"])
+
+    else:
+        env, env_params = BraxGymnaxWrapper(config["ENV_NAME"]), None
     env = LogWrapper(env)
     env = ClipAction(env)
     env = VecEnv(env)
@@ -293,7 +298,7 @@ if __name__ == "__main__":
         "LR": 3e-4,
         "NUM_ENVS": 2048,
         "NUM_STEPS": 10,
-        "TOTAL_TIMESTEPS": 5e7,
+        "TOTAL_TIMESTEPS": 5e5,
         "UPDATE_EPOCHS": 4,
         "NUM_MINIBATCHES": 32,
         "GAMMA": 0.99,
