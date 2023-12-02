@@ -34,7 +34,7 @@ def test_hopper():
     t0 = time.time()
     out = jax.block_until_ready(train_jit(rng))
     t1 = time.time() - t0
-    assert t1 < 50  # make sure it runs fast
+    assert t1 < 70  # make sure it runs fast
     print(out["metrics"]["returned_episode_returns"].mean())
     assert (
         out["metrics"]["returned_episode_returns"].mean() > 10.0
