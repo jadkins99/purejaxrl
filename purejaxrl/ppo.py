@@ -8,6 +8,7 @@ from flax.linen.initializers import constant, orthogonal
 from typing import Sequence, NamedTuple, Any
 from flax.training.train_state import TrainState
 import distrax
+import os
 import gymnax
 from purejaxrl.wrappers import LogWrapper, FlattenObservationWrapper
 
