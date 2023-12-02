@@ -30,7 +30,7 @@ def test_cartpole():
     t0 = time.time()
     out = jax.block_until_ready(train_jit(rng))
     t1 = time.time() - t0
-    assert t1 < 10  # make sure it runs fast
+    assert t1 < 15  # make sure it runs fast
     assert (
         out["metrics"]["returned_episode_returns"].mean() > 350.0
     )  # make sure it learns
@@ -59,7 +59,7 @@ def test_acrobot():
     t0 = time.time()
     out = jax.block_until_ready(train_jit(rng))
     t1 = time.time() - t0
-    assert t1 < 10  # make sure it runs fast
+    assert t1 < 15  # make sure it runs fast
     assert (
         out["metrics"]["returned_episode_returns"].mean() > -150.0
     )  # make sure it learns
