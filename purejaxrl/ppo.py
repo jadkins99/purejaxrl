@@ -11,9 +11,13 @@ import distrax
 import os
 import gymnax
 from purejaxrl.wrappers import LogWrapper, FlattenObservationWrapper
+from flax.struct import dataclass
+from flax.core import FrozenDict
+from typing import Callable
+from flax import struct
 
 
-class ActorCritic(nn.Module):
+class Actor(nn.Module):
     action_dim: Sequence[int]
     activation: str = "tanh"
 
@@ -36,6 +40,19 @@ class ActorCritic(nn.Module):
         )(actor_mean)
         pi = distrax.Categorical(logits=actor_mean)
 
+        return pi
+
+
+class Critic(nn.Module):
+    activation: str = "tanh"
+
+    @nn.compact
+    def __call__(self, x):
+        if self.activation == "relu":
+            activation = nn.relu
+        else:
+            activation = nn.tanh
+
         critic = nn.Dense(
             64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(x)
@@ -48,7 +65,19 @@ class ActorCritic(nn.Module):
             critic
         )
 
-        return pi, jnp.squeeze(critic, axis=-1)
+        return jnp.squeeze(critic, axis=-1)
+
+
+@dataclass
+class AgentParams:
+    actor_params: FrozenDict
+    critic_params: FrozenDict
+
+
+class AgentState(TrainState):
+    # Setting default values for agent functions to make TrainState work in jitted function
+    actor_fn: Callable = struct.field(pytree_node=False)
+    critic_fn: Callable = struct.field(pytree_node=False)
 
 
 class Transition(NamedTuple):
@@ -82,12 +111,16 @@ def make_train(config):
 
     def train(rng):
         # INIT NETWORK
-        network = ActorCritic(
+        actor_network = Actor(
             env.action_space(env_params).n, activation=config["ACTIVATION"]
         )
+        critic_network = Critic(activation=config["ACTIVATION"])
         rng, _rng = jax.random.split(rng)
         init_x = jnp.zeros(env.observation_space(env_params).shape)
-        network_params = network.init(_rng, init_x)
+        actor_network_params = actor_network.init(_rng, init_x)
+        rng, _rng = jax.random.split(rng)
+        critic_network_params = critic_network.init(_rng, init_x)
+
         if config["ANNEAL_LR"]:
             tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
@@ -98,10 +131,17 @@ def make_train(config):
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
                 optax.adam(config["LR"], eps=1e-5),
             )
-        train_state = TrainState.create(
-            apply_fn=network.apply,
-            params=network_params,
+
+        params = AgentParams(
+            actor_params=actor_network_params, critic_params=critic_network_params
+        )
+
+        train_state = AgentState.create(
+            apply_fn=None,
+            params=params,
             tx=tx,
+            actor_fn=actor_network.apply,
+            critic_fn=critic_network.apply,
         )
 
         # INIT ENV
@@ -117,7 +157,10 @@ def make_train(config):
 
                 # SELECT ACTION
                 rng, _rng = jax.random.split(rng)
-                pi, value = network.apply(train_state.params, last_obs)
+                pi = train_state.actor_fn(train_state.params.actor_params, last_obs)
+                value = train_state.critic_fn(
+                    train_state.params.critic_params, last_obs
+                )
                 action = pi.sample(seed=_rng)
                 log_prob = pi.log_prob(action)
 
@@ -139,7 +182,7 @@ def make_train(config):
 
             # CALCULATE ADVANTAGE
             train_state, env_state, last_obs, rng = runner_state
-            _, last_val = network.apply(train_state.params, last_obs)
+            last_val = train_state.critic_fn(train_state.params.critic_params, last_obs)
 
             def _calculate_gae(traj_batch, last_val):
                 def _get_advantages(gae_and_next_value, transition):
@@ -174,7 +217,10 @@ def make_train(config):
 
                     def _loss_fn(params, traj_batch, gae, targets):
                         # RERUN NETWORK
-                        pi, value = network.apply(params, traj_batch.obs)
+                        pi = train_state.actor_fn(params.actor_params, traj_batch.obs)
+                        value = train_state.critic_fn(
+                            params.critic_params, traj_batch.obs
+                        )
                         log_prob = pi.log_prob(traj_batch.action)
 
                         # CALCULATE VALUE LOSS
@@ -295,7 +341,7 @@ if __name__ == "__main__":
         "MAX_GRAD_NORM": 0.5,
         "ACTIVATION": "tanh",
         "ENV_NAME": "CartPole-v1",
-        "ANNEAL_LR": True,
+        "ANNEAL_LR": False,
         "DEBUG": True,
     }
     rng = jax.random.PRNGKey(30)
