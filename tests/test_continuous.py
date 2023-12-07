@@ -2,7 +2,7 @@ import sys
 import pytest
 
 sys.path.insert(1, "../purejaxrl")
-from purejaxrl.ppo_continuous_action import make_train
+from purejaxrl.online_learning_continuous import make_train
 import jax
 import time
 
