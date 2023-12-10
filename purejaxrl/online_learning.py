@@ -15,9 +15,8 @@ import flashbax as fbx
 
 from jax import config
 
+
 # config.update("jax_disable_jit", True)
-
-
 class Critic(nn.Module):
     activation: str = "tanh"
 
@@ -474,14 +473,14 @@ if __name__ == "__main__":
     train_jit = jax.jit(make_train(config))
     out = train_jit(rng)
 
-    import matplotlib.pyplot as plt
+    # import matplotlib.pyplot as plt
 
     # plt.plot(out["metrics"]["returned_episode_returns"].mean(-1).reshape(-1))
     # plt.xlabel("Update Step")
-    plt.plot(
-        out["metrics"]["timestep"].mean(-1).reshape(-1) * config["NUM_ENVS"],
-        out["metrics"]["returned_episode_returns"].mean(-1).reshape(-1),
-    )
-    plt.xlabel("Steps")
-    plt.ylabel("Return")
-    plt.show()
+    # plt.plot(
+    #     out["metrics"]["timestep"].mean(-1).reshape(-1) * config["NUM_ENVS"],
+    #     out["metrics"]["returned_episode_returns"].mean(-1).reshape(-1),
+    # )
+    # plt.xlabel("Steps")
+    # plt.ylabel("Return")
+    # plt.show()
