@@ -9,7 +9,8 @@ import time
 
 def test_cartpole():
     config = {
-        "LR": 2.5e-4,
+        "ACTOR_LR": 2.5e-4,
+        "CRITIC_LR": 2.5e-4,
         "NUM_ENVS": 4,
         "NUM_STEPS": 128,  # T = num_steps*num_envs
         "TOTAL_TIMESTEPS": 5e5,  # Z in pseudocode
@@ -43,7 +44,8 @@ def test_cartpole():
 
 def test_acrobot():
     config = {
-        "LR": 2.5e-4,
+        "ACTOR_LR": 2.5e-4,
+        "CRITIC_LR": 2.5e-4,
         "NUM_ENVS": 4,
         "NUM_STEPS": 128,  # T = num_steps*num_envs
         "TOTAL_TIMESTEPS": 5e5,  # Z in pseudocode

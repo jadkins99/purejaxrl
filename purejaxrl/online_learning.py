@@ -10,7 +10,7 @@ from flax.training.train_state import TrainState
 import distrax
 import os
 import gymnax
-from purejaxrl.wrappers import LogWrapper, FlattenObservationWrapper
+from wrappers import LogWrapper, FlattenObservationWrapper
 import flashbax as fbx
 
 from jax import config
@@ -124,11 +124,11 @@ def make_train(config):
         else:
             actor_tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-                optax.adam(config["LR"], eps=1e-5),
+                optax.adam(config["ACTOR_LR"], eps=1e-5),
             )
             critic_tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-                optax.adam(config["LR"], eps=1e-5),
+                optax.adam(config["CRITIC_LR"], eps=1e-5),
             )
         actor_train_state = TrainState.create(
             apply_fn=actor_network.apply,
@@ -302,13 +302,16 @@ def make_train(config):
                         value_pred_clipped = traj_batch.value + (
                             value - traj_batch.value
                         ).clip(-config["CLIP_EPS"], config["CLIP_EPS"])
-                        value_losses = jnp.square(value - targets)
+                        value_losses = jnp.square(
+                            value - jax.lax.stop_gradient(targets)
+                        )
                         value_losses_clipped = jnp.square(value_pred_clipped - targets)
                         value_loss = (
                             0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
                         )
+                        # value_loss = value_losses.mean()
 
-                        total_loss = config["VF_COEF"] * value_loss
+                        total_loss = value_loss
 
                         return total_loss, (value_loss,)
 
@@ -320,7 +323,7 @@ def make_train(config):
                         # CALCULATE ACTOR LOSS
                         ratio = jnp.exp(log_prob - traj_batch.log_prob)
                         gae = (gae - gae.mean()) / (gae.std() + 1e-8)
-                        loss_actor1 = ratio * gae
+                        loss_actor1 = log_prob * jax.lax.stop_gradient(gae)
                         loss_actor2 = (
                             jnp.clip(
                                 ratio,
@@ -330,6 +333,7 @@ def make_train(config):
                             * gae
                         )
                         loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
+                        loss_actor = -loss_actor1
                         loss_actor = loss_actor.mean()
                         entropy = pi.entropy().mean()
 
@@ -444,7 +448,8 @@ def make_train(config):
 
 if __name__ == "__main__":
     config = {
-        "LR": 2.5e-4,
+        "ACTOR_LR": 2.5e-4,
+        "CRITIC_LR": 2.5e-4,
         "NUM_ENVS": 4,
         "NUM_STEPS": 128,  # T = num_steps*num_envs
         "TOTAL_TIMESTEPS": 5e5,  # Z in pseudocode
@@ -468,6 +473,7 @@ if __name__ == "__main__":
     rng = jax.random.PRNGKey(30)
     train_jit = jax.jit(make_train(config))
     out = train_jit(rng)
+
     import matplotlib.pyplot as plt
 
     # plt.plot(out["metrics"]["returned_episode_returns"].mean(-1).reshape(-1))
