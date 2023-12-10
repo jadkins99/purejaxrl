@@ -11,6 +11,11 @@ import distrax
 import os
 import gymnax
 from purejaxrl.wrappers import LogWrapper, FlattenObservationWrapper
+import flashbax as fbx
+
+from jax import config
+
+# config.update("jax_disable_jit", True)
 
 
 class Critic(nn.Module):
@@ -71,6 +76,7 @@ class Transition(NamedTuple):
     reward: jnp.ndarray
     log_prob: jnp.ndarray
     obs: jnp.ndarray
+    last_obs: jnp.ndarray
     info: jnp.ndarray
 
 
@@ -135,54 +141,41 @@ def make_train(config):
             tx=critic_tx,
         )
 
+        # initialize replay buffer
+        d_obs, d_env_state = env.reset(rng, env_params)
+        pi = actor_network.apply(actor_train_state.params, d_obs)
+        d_action = pi.sample(seed=rng)
+        d_log_prob = pi.log_prob(d_action)
+        d_value = critic_network.apply(critic_train_state.params, d_obs)
+        d_last_obs, d_env_state, d_reward, d_done, d_info = env.step(
+            rng, d_env_state, d_action, env_params
+        )
+        dummy_transition = Transition(
+            done=d_done,
+            action=d_action,
+            value=d_value,
+            reward=d_reward,
+            log_prob=d_log_prob,
+            obs=d_obs,
+            last_obs=d_last_obs,
+            info=d_info,
+        )
+        replay_buffer = fbx.make_trajectory_buffer(
+            min_length_time_axis=config["MIN_BUFFER_SIZE"] // config["NUM_ENVS"],
+            max_size=config["BUFFER_SIZE"],
+            sample_batch_size=config["BATCH_SIZE"] * config["NUM_MINIBATCHES"],
+            add_batch_size=config["NUM_ENVS"],
+            sample_sequence_length=config["BATCH_LENGTH"],
+            period=1,
+        )
+        buffer_state = replay_buffer.init(dummy_transition)
+
         # INIT ENV
         rng, _rng = jax.random.split(rng)
         reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
         obsv, env_state = jax.vmap(env.reset, in_axes=(0, None))(reset_rng, env_params)
 
-        # TRAIN LOOP
-        def _update_step(runner_state, unused):
-            # COLLECT TRAJECTORIES
-            def _env_step(runner_state, unused):
-                (
-                    actor_train_state,
-                    critic_train_state,
-                    env_state,
-                    last_obs,
-                    rng,
-                ) = runner_state
-
-                # SELECT ACTION
-                rng, _rng = jax.random.split(rng)
-                pi = actor_network.apply(actor_train_state.params, last_obs)
-                value = critic_network.apply(critic_train_state.params, last_obs)
-
-                action = pi.sample(seed=_rng)
-                log_prob = pi.log_prob(action)
-
-                # STEP ENV
-                rng, _rng = jax.random.split(rng)
-                rng_step = jax.random.split(_rng, config["NUM_ENVS"])
-                obsv, env_state, reward, done, info = jax.vmap(
-                    env.step, in_axes=(0, 0, 0, None)
-                )(rng_step, env_state, action, env_params)
-                transition = Transition(
-                    done, action, value, reward, log_prob, last_obs, info
-                )
-                runner_state = (
-                    actor_train_state,
-                    critic_train_state,
-                    env_state,
-                    obsv,
-                    rng,
-                )
-                return runner_state, transition
-
-            runner_state, traj_batch = jax.lax.scan(
-                _env_step, runner_state, None, config["NUM_STEPS"]
-            )
-
-            # CALCULATE ADVANTAGE
+        def _env_step(runner_state, unused):
             (
                 actor_train_state,
                 critic_train_state,
@@ -190,36 +183,113 @@ def make_train(config):
                 last_obs,
                 rng,
             ) = runner_state
-            last_val = critic_network.apply(critic_train_state.params, last_obs)
 
-            def _calculate_gae(traj_batch, last_val):
-                def _get_advantages(gae_and_next_value, transition):
-                    gae, next_value = gae_and_next_value
-                    done, value, reward = (
-                        transition.done,
-                        transition.value,
-                        transition.reward,
-                    )
-                    delta = reward + config["GAMMA"] * next_value * (1 - done) - value
-                    gae = (
-                        delta
-                        + config["GAMMA"] * config["GAE_LAMBDA"] * (1 - done) * gae
-                    )
-                    return (gae, value), gae
+            # SELECT ACTION
+            rng, _rng = jax.random.split(rng)
+            pi = actor_network.apply(actor_train_state.params, last_obs)
+            value = critic_network.apply(critic_train_state.params, last_obs)
 
-                _, advantages = jax.lax.scan(
-                    _get_advantages,
-                    (jnp.zeros_like(last_val), last_val),
-                    traj_batch,
-                    reverse=True,
-                    unroll=16,
-                )
-                return advantages, advantages + traj_batch.value
+            action = pi.sample(seed=_rng)
+            log_prob = pi.log_prob(action)
 
-            advantages, targets = _calculate_gae(traj_batch, last_val)
+            # STEP ENV
+            rng, _rng = jax.random.split(rng)
+            rng_step = jax.random.split(_rng, config["NUM_ENVS"])
+            obsv, env_state, reward, done, info = jax.vmap(
+                env.step, in_axes=(0, 0, 0, None)
+            )(rng_step, env_state, action, env_params)
+            transition = Transition(
+                done, action, value, reward, log_prob, last_obs, obsv, info
+            )
+            runner_state = (
+                actor_train_state,
+                critic_train_state,
+                env_state,
+                obsv,
+                rng,
+            )
+            return runner_state, transition
+
+        runner_state = (actor_train_state, critic_train_state, env_state, obsv, rng)
+        runner_state, traj_batch = jax.lax.scan(
+            _env_step,
+            runner_state,
+            None,
+            config["MIN_BUFFER_SIZE"] // config["NUM_ENVS"],
+        )
+        swap_axis = lambda arr: jnp.moveaxis(arr, 0, 1)
+        traj_batch_buffer = jax.tree_util.tree_map(swap_axis, traj_batch)
+        buffer_state = replay_buffer.add(buffer_state, traj_batch_buffer)
+
+        # TRAIN LOOP
+        def _update_step(runner_state, unused):
+            # COLLECT TRAJECTORIES
+            env_runner_state = runner_state[:-1]
+            buffer_state = runner_state[-1]
+            env_runner_state, traj_batch = jax.lax.scan(
+                _env_step, env_runner_state, None, config["NUM_STEPS"]
+            )
+            traj_batch_buffer = jax.tree_util.tree_map(swap_axis, traj_batch)
+            buffer_state = replay_buffer.add(buffer_state, traj_batch_buffer)
+
+            (
+                actor_train_state,
+                critic_train_state,
+                env_state,
+                last_obs,
+                rng,
+            ) = env_runner_state
 
             # UPDATE NETWORK
             def _update_epoch(update_state, unused):
+                (
+                    actor_train_state,
+                    critic_train_state,
+                    buffer_state,
+                    rng,
+                ) = update_state
+
+                # SAMPLE FROM BUFFER
+                rng, _rng = jax.random.split(rng)
+                sampled_batch = replay_buffer.sample(buffer_state, _rng)
+                sampled_batch = jax.tree_util.tree_map(swap_axis, sampled_batch)
+
+                last_obs_buffer = sampled_batch.experience.last_obs[-1, ...]
+                last_val_buffer = critic_network.apply(
+                    critic_train_state.params, last_obs_buffer
+                )
+
+                # CALCULATE ADVANTAGE
+                def _calculate_gae(traj_batch, last_val):
+                    def _get_advantages(gae_and_next_value, transition):
+                        gae, next_value = gae_and_next_value
+                        done, value, reward = (
+                            transition.done,
+                            transition.value,
+                            transition.reward,
+                        )
+                        delta = (
+                            reward + config["GAMMA"] * next_value * (1 - done) - value
+                        )
+                        gae = (
+                            delta
+                            + config["GAMMA"] * config["GAE_LAMBDA"] * (1 - done) * gae
+                        )
+                        return (gae, value), gae
+
+                    _, advantages = jax.lax.scan(
+                        _get_advantages,
+                        (jnp.zeros_like(last_val), last_val),
+                        traj_batch,
+                        reverse=True,
+                        unroll=16,
+                    )
+                    return advantages, advantages + traj_batch.value
+
+                advantages, targets = _calculate_gae(
+                    sampled_batch.experience, last_val_buffer
+                )
+
                 def _update_minbatch(train_state, batch_info):
                     traj_batch, advantages, targets = batch_info
                     actor_train_state, critic_train_state = train_state
@@ -289,33 +359,19 @@ def make_train(config):
                     train_state = (actor_train_state, critic_train_state)
                     return train_state, total_loss
 
-                (
-                    actor_train_state,
-                    critic_train_state,
-                    traj_batch,
-                    advantages,
-                    targets,
-                    rng,
-                ) = update_state
                 rng, _rng = jax.random.split(rng)
-                batch_size = config["MINIBATCH_SIZE"] * config["NUM_MINIBATCHES"]
-                assert (
-                    batch_size == config["NUM_STEPS"] * config["NUM_ENVS"]
-                ), "batch size must be equal to number of steps * number of envs"
-                permutation = jax.random.permutation(_rng, batch_size)
-                batch = (traj_batch, advantages, targets)
-                batch = jax.tree_util.tree_map(
-                    lambda x: x.reshape((batch_size,) + x.shape[2:]), batch
+
+                batch = (sampled_batch.experience, advantages, targets)
+
+                batch = jax.tree_util.tree_map(swap_axis, batch)
+
+                resize_minibatches = lambda x: jnp.reshape(
+                    x,
+                    [config["NUM_MINIBATCHES"], config["BATCH_SIZE"]]
+                    + list(x.shape[1:]),
                 )
-                shuffled_batch = jax.tree_util.tree_map(
-                    lambda x: jnp.take(x, permutation, axis=0), batch
-                )
-                minibatches = jax.tree_util.tree_map(
-                    lambda x: jnp.reshape(
-                        x, [config["NUM_MINIBATCHES"], -1] + list(x.shape[1:])
-                    ),
-                    shuffled_batch,
-                )
+                minibatches = jax.tree_util.tree_map(resize_minibatches, batch)
+
                 train_state = (actor_train_state, critic_train_state)
                 train_state, total_loss = jax.lax.scan(
                     _update_minbatch, train_state, minibatches
@@ -324,9 +380,7 @@ def make_train(config):
                 update_state = (
                     actor_train_state,
                     critic_train_state,
-                    traj_batch,
-                    advantages,
-                    targets,
+                    buffer_state,
                     rng,
                 )
                 return update_state, total_loss
@@ -334,9 +388,7 @@ def make_train(config):
             update_state = (
                 actor_train_state,
                 critic_train_state,
-                traj_batch,
-                advantages,
-                targets,
+                buffer_state,
                 rng,
             )
             update_state, loss_info = jax.lax.scan(
@@ -369,11 +421,19 @@ def make_train(config):
                 env_state,
                 last_obs,
                 rng,
+                buffer_state,
             )
             return runner_state, metric
 
         rng, _rng = jax.random.split(rng)
-        runner_state = (actor_train_state, critic_train_state, env_state, obsv, _rng)
+        runner_state = (
+            actor_train_state,
+            critic_train_state,
+            env_state,
+            obsv,
+            _rng,
+            buffer_state,
+        )
         runner_state, metric = jax.lax.scan(
             _update_step, runner_state, None, config["NUM_UPDATES"]
         )
@@ -386,10 +446,10 @@ if __name__ == "__main__":
     config = {
         "LR": 2.5e-4,
         "NUM_ENVS": 4,
-        "NUM_STEPS": 128,
-        "TOTAL_TIMESTEPS": 5e5,
-        "UPDATE_EPOCHS": 4,
-        "NUM_MINIBATCHES": 4,
+        "NUM_STEPS": 128,  # T = num_steps*num_envs
+        "TOTAL_TIMESTEPS": 5e5,  # Z in pseudocode
+        "UPDATE_EPOCHS": 4,  # E in pseudocode
+        "NUM_MINIBATCHES": 4,  # M in pseudocode
         "GAMMA": 0.99,
         "GAE_LAMBDA": 0.95,
         "CLIP_EPS": 0.2,
@@ -398,15 +458,24 @@ if __name__ == "__main__":
         "MAX_GRAD_NORM": 0.5,
         "ACTIVATION": "tanh",
         "ENV_NAME": "CartPole-v1",
-        "ANNEAL_LR": True,
+        "ANNEAL_LR": False,
         "DEBUG": True,
+        "BUFFER_SIZE": 512,  # C in psuedocode
+        "MIN_BUFFER_SIZE": 512,
+        "BATCH_SIZE": 4,  # N = C/batch_size in psueudocode
+        "BATCH_LENGTH": 128,
     }
     rng = jax.random.PRNGKey(30)
     train_jit = jax.jit(make_train(config))
     out = train_jit(rng)
     import matplotlib.pyplot as plt
 
-    plt.plot(out["metrics"]["returned_episode_returns"].mean(-1).reshape(-1))
-    plt.xlabel("Update Step")
+    # plt.plot(out["metrics"]["returned_episode_returns"].mean(-1).reshape(-1))
+    # plt.xlabel("Update Step")
+    plt.plot(
+        out["metrics"]["timestep"].mean(-1).reshape(-1) * config["NUM_ENVS"],
+        out["metrics"]["returned_episode_returns"].mean(-1).reshape(-1),
+    )
+    plt.xlabel("Steps")
     plt.ylabel("Return")
     plt.show()
