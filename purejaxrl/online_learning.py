@@ -12,7 +12,7 @@ import os
 import gymnax
 from wrappers import LogWrapper, FlattenObservationWrapper
 import flashbax as fbx
-
+import pickle
 from jax import config
 
 
@@ -98,7 +98,7 @@ def make_train(config):
         )
         return config["LR"] * frac
 
-    def train(rng):
+    def train(rng, ENT_COEF, ACTOR_LR, CRITIC_LR, GAE_LAMBDA):
         # INIT NETWORK
         actor_network = Actor(
             env.action_space(env_params).n, activation=config["ACTIVATION"]
@@ -123,11 +123,11 @@ def make_train(config):
         else:
             actor_tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-                optax.adam(config["ACTOR_LR"], eps=1e-5),
+                optax.adam(ACTOR_LR, eps=1e-5),
             )
             critic_tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-                optax.adam(config["CRITIC_LR"], eps=1e-5),
+                optax.adam(CRITIC_LR, eps=1e-5),
             )
         actor_train_state = TrainState.create(
             apply_fn=actor_network.apply,
@@ -270,10 +270,7 @@ def make_train(config):
                         delta = (
                             reward + config["GAMMA"] * next_value * (1 - done) - value
                         )
-                        gae = (
-                            delta
-                            + config["GAMMA"] * config["GAE_LAMBDA"] * (1 - done) * gae
-                        )
+                        gae = delta + config["GAMMA"] * GAE_LAMBDA * (1 - done) * gae
                         return (gae, value), gae
 
                     _, advantages = jax.lax.scan(
@@ -298,17 +295,17 @@ def make_train(config):
                         value = critic_network.apply(critic_params, traj_batch.obs)
 
                         # CALCULATE VALUE LOSS
-                        value_pred_clipped = traj_batch.value + (
-                            value - traj_batch.value
-                        ).clip(-config["CLIP_EPS"], config["CLIP_EPS"])
+                        # value_pred_clipped = traj_batch.value + (
+                        #     value - traj_batch.value
+                        # ).clip(-config["CLIP_EPS"], config["CLIP_EPS"])
                         value_losses = jnp.square(
                             value - jax.lax.stop_gradient(targets)
                         )
-                        value_losses_clipped = jnp.square(value_pred_clipped - targets)
-                        value_loss = (
-                            0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
-                        )
-                        # value_loss = value_losses.mean()
+                        # value_losses_clipped = jnp.square(value_pred_clipped - targets)
+                        # value_loss = (
+                        #     0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
+                        # )
+                        value_loss = value_losses.mean()
 
                         total_loss = value_loss
 
@@ -323,20 +320,20 @@ def make_train(config):
                         ratio = jnp.exp(log_prob - traj_batch.log_prob)
                         gae = (gae - gae.mean()) / (gae.std() + 1e-8)
                         loss_actor1 = log_prob * jax.lax.stop_gradient(gae)
-                        loss_actor2 = (
-                            jnp.clip(
-                                ratio,
-                                1.0 - config["CLIP_EPS"],
-                                1.0 + config["CLIP_EPS"],
-                            )
-                            * gae
-                        )
-                        loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
+                        # loss_actor2 = (
+                        #     jnp.clip(
+                        #         ratio,
+                        #         1.0 - config["CLIP_EPS"],
+                        #         1.0 + config["CLIP_EPS"],
+                        #     )
+                        #     * gae
+                        # )
+                        # loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
                         loss_actor = -loss_actor1
                         loss_actor = loss_actor.mean()
                         entropy = pi.entropy().mean()
 
-                        total_loss = loss_actor - config["ENT_COEF"] * entropy
+                        total_loss = loss_actor - ENT_COEF * entropy
 
                         return total_loss, (loss_actor, entropy)
 
@@ -447,40 +444,126 @@ def make_train(config):
 
 if __name__ == "__main__":
     config = {
-        "ACTOR_LR": 2.5e-4,
-        "CRITIC_LR": 2.5e-4,
+        # "ACTOR_LR": 2.5e-4,
+        # "CRITIC_LR": 2.5e-4,
         "NUM_ENVS": 4,
-        "NUM_STEPS": 128,  # T = num_steps*num_envs
+        "NUM_STEPS": 1,  # T = num_steps*num_envs
         "TOTAL_TIMESTEPS": 5e5,  # Z in pseudocode
-        "UPDATE_EPOCHS": 4,  # E in pseudocode
-        "NUM_MINIBATCHES": 4,  # M in pseudocode
+        "UPDATE_EPOCHS": 1,  # E in pseudocode
+        "NUM_MINIBATCHES": 1,  # M in pseudocode
         "GAMMA": 0.99,
-        "GAE_LAMBDA": 0.95,
+        # "GAE_LAMBDA": 0.95,
         "CLIP_EPS": 0.2,
         "ENT_COEF": 0.01,
         "VF_COEF": 0.5,
         "MAX_GRAD_NORM": 0.5,
-        "ACTIVATION": "tanh",
-        "ENV_NAME": "CartPole-v1",
+        "ACTIVATION": "relu",
+        "ENV_NAME": "Acrobot-v1",
         "ANNEAL_LR": False,
         "DEBUG": True,
-        "BUFFER_SIZE": 512,  # C in psuedocode
-        "MIN_BUFFER_SIZE": 512,
-        "BATCH_SIZE": 4,  # N = C/batch_size in psueudocode
-        "BATCH_LENGTH": 128,
+        "BUFFER_SIZE": 100000,  # C in psuedocode
+        "MIN_BUFFER_SIZE": 100,
+        "BATCH_SIZE": 32,  # N = C/batch_size in psueudocode
+        "BATCH_LENGTH": 15,
     }
-    rng = jax.random.PRNGKey(30)
-    train_jit = jax.jit(make_train(config))
-    out = train_jit(rng)
+    rng = jax.random.PRNGKey(42)
+    num_seeds = 10
+    # gae_lambdas = jnp.array([0.1, 0.5, 0.7, 0.9, 1.0])
+    # critic_lrs = jnp.array([10.0e-5, 10.0e-4, 10.0e-3, 10.0e-2, 10.0e-1])
+    # actor_lrs = jnp.array([10.0e-5, 10.0e-4, 10.0e-3, 10.0e-2, 10.0e-1])
+    # ent_coefs = jnp.array([10.0e-3, 10.0e-2, 10.0e-1, 10.0e0, 10.0e1])
+    gae_lambdas = jnp.array([0.95])
+
+    critic_lrs = jnp.array([2.5e-4])
+    actor_lrs = jnp.array([2.5e-4])
+    ent_coefs = jnp.array([10.0])
+
+    rngs = jax.random.split(rng, num_seeds)
+
+    # train_vjit = jax.jit(jax.vmap(make_train(config)))
+
+    train_vvjit = jax.jit(
+        jax.vmap(
+            jax.vmap(
+                jax.vmap(
+                    jax.vmap(
+                        jax.vmap(
+                            make_train(config),
+                            in_axes=(0, None, None, None, None),
+                        ),
+                        in_axes=(None, 0, None, None, None),
+                    ),
+                    in_axes=(None, None, 0, None, None),
+                ),
+                in_axes=(None, None, None, 0, None),
+            ),
+            in_axes=(None, None, None, None, 0),
+        ),
+    )
+
+    t0 = time.time()
+    # outs is indexed in reverse  order that the args are placed
+    # i.e. outs.shape = (gae_lambdas, critic_lrs, actor_lrs, ent_coefs, rngs, NUM_UPDATES, 1, NUM_ENVS)
+    outs = jax.block_until_ready(
+        train_vvjit(rngs, ent_coefs, actor_lrs, critic_lrs, gae_lambdas)
+    )
+    print(f"time: {time.time() - t0:.2f} s")
+
+    with open("/home/jadkins/scratch/lambda_ac.pkl", "wb") as f:
+        pickle.dump(outs["metrics"], f)
 
     # import matplotlib.pyplot as plt
 
-    # plt.plot(out["metrics"]["returned_episode_returns"].mean(-1).reshape(-1))
+    # plt.plot(outs["metrics"]["returned_episode_returns"].mean(-1).reshape(-1))
     # plt.xlabel("Update Step")
-    # plt.plot(
-    #     out["metrics"]["timestep"].mean(-1).reshape(-1) * config["NUM_ENVS"],
-    #     out["metrics"]["returned_episode_returns"].mean(-1).reshape(-1),
-    # )
+    # for gae_lambdas_idx in range(gae_lambdas.size):
+    #     for critic_lrs_idx in range(critic_lrs.size):
+    #         for actor_lrs_idx in range(actor_lrs.size):
+    #             for ent_coefs_idx in range(ent_coefs.size):
+    #                 for seed in range(num_seeds):
+    #                     competed_episode_lengths = outs["metrics"][
+    #                         "returned_episode_lengths"
+    #                     ][
+    #                         gae_lambdas_idx,
+    #                         critic_lrs_idx,
+    #                         actor_lrs_idx,
+    #                         ent_coefs_idx,
+    #                         seed,
+    #                         ...,
+    #                     ][
+    #                         outs["metrics"]["returned_episode"][
+    #                             gae_lambdas_idx,
+    #                             critic_lrs_idx,
+    #                             actor_lrs_idx,
+    #                             ent_coefs_idx,
+    #                             seed,
+    #                             ...,
+    #                         ]
+    #                         == True
+    #                     ]
+    #                     experience = jnp.cumsum(competed_episode_lengths)
+    #                     returns = outs["metrics"]["returned_episode_returns"][
+    #                         gae_lambdas_idx,
+    #                         critic_lrs_idx,
+    #                         actor_lrs_idx,
+    #                         ent_coefs_idx,
+    #                         seed,
+    #                         ...,
+    #                     ][
+    #                         outs["metrics"]["returned_episode"][
+    #                             gae_lambdas_idx,
+    #                             critic_lrs_idx,
+    #                             actor_lrs_idx,
+    #                             ent_coefs_idx,
+    #                             seed,
+    #                             ...,
+    #                         ]
+    #                         == True
+    #                     ]
+
+    #                     # plt.plot(outs["metrics"]["returned_episode_returns"][i].mean(-1).reshape(-1))
+    #                     plt.plot(experience, returns)
+
     # plt.xlabel("Steps")
     # plt.ylabel("Return")
     # plt.show()
