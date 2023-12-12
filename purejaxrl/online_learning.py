@@ -14,6 +14,7 @@ from wrappers import LogWrapper, FlattenObservationWrapper
 import flashbax as fbx
 import pickle
 from jax import config
+from env_params import *
 
 
 # config.update("jax_disable_jit", True)
@@ -87,6 +88,12 @@ def make_train(config):
         config["NUM_ENVS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
     )
     env, env_params = gymnax.make(config["ENV_NAME"])
+
+    if config["ENV_NAME"] == "Acrobot-v1":
+        env_params = AcrobotEnvParams()
+    elif config["ENV_NAME"] == "MountainCar-v1":
+        env_params = MCEnvParams()
+
     env = FlattenObservationWrapper(env)
     env = LogWrapper(env)
 
