@@ -26,6 +26,10 @@ from jax import config
 # config.update("jax_disable_jit", True)
 
 
+class ActorTrainState(TrainState):
+    advn_stats: dict[float, float]
+
+
 class Critic(nn.Module):
     activation: str = "tanh"
 
@@ -150,10 +154,11 @@ def make_train(config):
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
                 optax.adam(config["CRITIC_LR"], eps=1e-5),
             )
-        actor_train_state = TrainState.create(
+        actor_train_state = ActorTrainState.create(
             apply_fn=actor_network.apply,
             params=actor_network_params,
             tx=actor_tx,
+            advn_stats={},
         )
         critic_train_state = TrainState.create(
             apply_fn=critic_network.apply,
@@ -165,6 +170,27 @@ def make_train(config):
         rng, _rng = jax.random.split(rng)
         reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
         obsv, env_state = env.reset(reset_rng, env_params)
+
+        def _calculate_gae(traj_batch, last_val):
+            def _get_advantages(gae_and_next_value, transition):
+                gae, next_value = gae_and_next_value
+                done, value, reward = (
+                    transition.done,
+                    transition.value,
+                    transition.reward,
+                )
+                delta = reward + config["GAMMA"] * next_value * (1 - done) - value
+                gae = delta + config["GAMMA"] * config["GAE_LAMBDA"] * (1 - done) * gae
+                return (gae, value), gae
+
+            _, advantages = jax.lax.scan(
+                _get_advantages,
+                (jnp.zeros_like(last_val), last_val),
+                traj_batch,
+                reverse=True,
+                unroll=16,
+            )
+            return advantages, advantages + traj_batch.value
 
         # COLLECT TRAJECTORIES
         def _env_step(runner_state, unused):
@@ -255,10 +281,20 @@ def make_train(config):
         traj_batch_buffer = jax.tree_util.tree_map(swap_axis, traj_batch)
         buffer_state = replay_buffer.add(buffer_state, traj_batch_buffer)
 
+        last_obs = traj_batch.last_obs[-1, ...]
+        last_val = critic_network.apply(critic_train_state.params, last_obs)
+
+        advantages, _ = _calculate_gae(traj_batch, last_val)
+        advn_per_95 = jnp.percentile(advantages, 95)
+        advn_per_5 = jnp.percentile(advantages, 5)
+        actor_train_state.advn_stats["advn_per_5"] = advn_per_5
+        actor_train_state.advn_stats["advn_per_95"] = advn_per_95
+
         # TRAIN LOOP
         def _update_step(input_runner_state, unused):
             runner_state = input_runner_state[:-1]
             buffer_state = input_runner_state[-1]
+
             runner_state, traj_batch = jax.lax.scan(
                 _env_step, runner_state, None, config["NUM_STEPS"]
             )
@@ -278,41 +314,28 @@ def make_train(config):
             sampled_batch = replay_buffer.sample(buffer_state, _rng)
             sampled_batch = jax.tree_util.tree_map(swap_axis, sampled_batch)
             last_obs_buffer = sampled_batch.experience.last_obs[-1, ...]
-            last_obs_buffer = sampled_batch.experience.last_obs[-1, ...]
             last_val_buffer = critic_network.apply(
                 critic_train_state.params, last_obs_buffer
             )
 
-            # last_val = critic_network.apply(critic_train_state.params, last_obs)
+            last_val = critic_network.apply(critic_train_state.params, last_obs)
 
             # CALCULATE ADVANTAGE
 
-            def _calculate_gae(traj_batch, last_val):
-                def _get_advantages(gae_and_next_value, transition):
-                    gae, next_value = gae_and_next_value
-                    done, value, reward = (
-                        transition.done,
-                        transition.value,
-                        transition.reward,
-                    )
-                    delta = reward + config["GAMMA"] * next_value * (1 - done) - value
-                    gae = (
-                        delta
-                        + config["GAMMA"] * config["GAE_LAMBDA"] * (1 - done) * gae
-                    )
-                    return (gae, value), gae
-
-                _, advantages = jax.lax.scan(
-                    _get_advantages,
-                    (jnp.zeros_like(last_val), last_val),
-                    traj_batch,
-                    reverse=True,
-                    unroll=16,
-                )
-                return advantages, advantages + traj_batch.value
-
             advantages, targets = _calculate_gae(
                 sampled_batch.experience, last_val_buffer
+            )
+            advantages_recent, _ = _calculate_gae(traj_batch, last_val)
+            # COMPUTE ADVANTAGE STATISTICS
+            actor_train_state.advn_stats["advn_per_5"] = (
+                config["ADVANTAGE_EMA_RATE"] * jnp.percentile(advantages_recent, 5)
+                + (1 - config["ADVANTAGE_EMA_RATE"])
+                * actor_train_state.advn_stats["advn_per_5"]
+            )
+            actor_train_state.advn_stats["advn_per_95"] = (
+                config["ADVANTAGE_EMA_RATE"] * jnp.percentile(advantages_recent, 5)
+                + (1 - config["ADVANTAGE_EMA_RATE"])
+                * actor_train_state.advn_stats["advn_per_95"]
             )
 
             # UPDATE NETWORK
@@ -321,42 +344,60 @@ def make_train(config):
                     traj_batch, advantages, targets = batch_info
                     actor_train_state, critic_train_state = train_state
 
-                    def _critic_loss_fn(critic_params, traj_batch, gae, targets):
+                    def _critic_loss_fn(critic_params, traj_batch, targets):
                         # RERUN NETWORK
                         value = critic_network.apply(critic_params, traj_batch.obs)
 
                         # CALCULATE VALUE LOSS
-                        value_pred_clipped = traj_batch.value + (
-                            value - traj_batch.value
-                        ).clip(-config["CLIP_EPS"], config["CLIP_EPS"])
-                        value_losses = jnp.square(value - targets)
-                        value_losses_clipped = jnp.square(value_pred_clipped - targets)
-                        value_loss = (
-                            0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
+                        # value_pred_clipped = traj_batch.value + (
+                        #     value - traj_batch.value
+                        # ).clip(-config["CLIP_EPS"], config["CLIP_EPS"])
+                        value_losses = jnp.square(
+                            value - jax.lax.stop_gradient(targets)
                         )
-
-                        total_loss = config["VF_COEF"] * value_loss
+                        # value_losses_clipped = jnp.square(value_pred_clipped - targets)
+                        # value_loss = (
+                        #     0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
+                        # )
+                        value_loss = value_losses.mean()
+                        total_loss = value_loss
 
                         return total_loss, (value_loss,)
 
-                    def _actor_loss_fn(actor_params, traj_batch, gae, targets):
+                    def _actor_loss_fn(actor_params, traj_batch, gae, advn_stats):
                         # RERUN NETWORK
                         pi = actor_network.apply(actor_params, traj_batch.obs)
                         log_prob = pi.log_prob(traj_batch.action)
 
                         # CALCULATE ACTOR LOSS
-                        ratio = jnp.exp(log_prob - traj_batch.log_prob)
-                        gae = (gae - gae.mean()) / (gae.std() + 1e-8)
-                        loss_actor1 = ratio * gae
-                        loss_actor2 = (
-                            jnp.clip(
-                                ratio,
-                                1.0 - config["CLIP_EPS"],
-                                1.0 + config["CLIP_EPS"],
+                        # ratio = jnp.exp(log_prob - traj_batch.log_prob)
+                        if config["ADVN_NORM"] == "MEAN":
+                            gae = (gae - gae.mean()) / (gae.std() + 1e-8)
+
+                        elif config["ADVN_NORM"] == "EMA":
+                            gae = gae / (
+                                advn_stats["advn_per_95"] - advn_stats["advn_per_5"]
                             )
-                            * gae
-                        )
-                        loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
+
+                        elif config["ADVN_NORM"] == "MAX_EMA":
+                            gae = gae / (
+                                jnp.maximum(
+                                    1,
+                                    advn_stats["advn_per_95"]
+                                    - advn_stats["advn_per_5"],
+                                )
+                            )
+                        # loss_actor1 = ratio * gae
+                        # loss_actor2 = (
+                        #     jnp.clip(
+                        #         ratio,
+                        #         1.0 - config["CLIP_EPS"],
+                        #         1.0 + config["CLIP_EPS"],
+                        #     )
+                        #     * gae
+                        # )
+                        loss_actor = log_prob * jax.lax.stop_gradient(gae)
+                        # loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
                         loss_actor = loss_actor.mean()
                         entropy = pi.entropy().mean()
 
@@ -368,10 +409,13 @@ def make_train(config):
                     critic_grad_fn = jax.value_and_grad(_critic_loss_fn, has_aux=True)
 
                     critic_loss, critic_grads = critic_grad_fn(
-                        critic_train_state.params, traj_batch, advantages, targets
+                        critic_train_state.params, traj_batch, targets
                     )
                     actor_loss, actor_grads = actor_grad_fn(
-                        actor_train_state.params, traj_batch, advantages, targets
+                        actor_train_state.params,
+                        traj_batch,
+                        advantages,
+                        actor_train_state.advn_stats,
                     )
                     total_loss = actor_loss + critic_loss
 
@@ -505,9 +549,10 @@ if __name__ == "__main__":
         "TOTAL_TIMESTEPS": 5e5,  # Z in pseudocode
         "UPDATE_EPOCHS": 4,  # E in pseudocode
         "NUM_MINIBATCHES": 32,  # M in pseudocode
+        "ADVANTAGE_EMA_RATE": 0.02,
+        "ADVN_NORM": "MAX_EMA",
         "GAMMA": 0.99,
         "GAE_LAMBDA": 0.95,
-        "CLIP_EPS": 0.2,
         "ENT_COEF": 0.1,
         "VF_COEF": 0.5,
         "MAX_GRAD_NORM": 0.5,
