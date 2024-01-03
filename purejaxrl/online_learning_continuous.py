@@ -171,6 +171,12 @@ def make_train(config):
         reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
         obsv, env_state = env.reset(reset_rng, env_params)
 
+        def symlog(x):
+            return jnp.sign(x) * jnp.log(1 + jnp.abs(x))
+
+        def symexp(x):
+            return jnp.sign(x) * (jnp.exp(jnp.abs(x)) - 1)
+
         def _calculate_gae(traj_batch, last_val):
             def _get_advantages(gae_and_next_value, transition):
                 gae, next_value = gae_and_next_value
@@ -206,6 +212,9 @@ def make_train(config):
             rng, _rng = jax.random.split(rng)
             pi = actor_network.apply(actor_train_state.params, last_obs)
             value = critic_network.apply(critic_train_state.params, last_obs)
+
+            if config["SYMLOG_CRITIC_TARGETS"]:
+                value = symexp(value)
 
             action = pi.sample(seed=_rng)
             log_prob = pi.log_prob(action)
@@ -283,6 +292,8 @@ def make_train(config):
 
         last_obs = traj_batch.last_obs[-1, ...]
         last_val = critic_network.apply(critic_train_state.params, last_obs)
+        if config["SYMLOG_CRITIC_TARGETS"]:
+            last_val = symexp(last_val)
 
         advantages, _ = _calculate_gae(traj_batch, last_val)
         advn_per_95 = jnp.percentile(advantages, 95)
@@ -320,6 +331,10 @@ def make_train(config):
 
             last_val = critic_network.apply(critic_train_state.params, last_obs)
 
+            if config["SYMLOG_CRITIC_TARGETS"]:
+                last_val_buffer = symexp(last_val_buffer)
+                last_val = symexp(last_val)
+
             # CALCULATE ADVANTAGE
 
             advantages, targets = _calculate_gae(
@@ -345,6 +360,8 @@ def make_train(config):
                     actor_train_state, critic_train_state = train_state
 
                     def _critic_loss_fn(critic_params, traj_batch, targets):
+                        if config["SYMLOG_CRITIC_TARGETS"]:
+                            targets = symlog(targets)
                         # RERUN NETWORK
                         value = critic_network.apply(critic_params, traj_batch.obs)
 
@@ -550,7 +567,7 @@ if __name__ == "__main__":
         "UPDATE_EPOCHS": 4,  # E in pseudocode
         "NUM_MINIBATCHES": 32,  # M in pseudocode
         "ADVANTAGE_EMA_RATE": 0.02,
-        "ADVN_NORM": "MAX_EMA",
+        "ADVN_NORM": "Off",
         "GAMMA": 0.99,
         "GAE_LAMBDA": 0.95,
         "ENT_COEF": 0.1,
@@ -565,6 +582,7 @@ if __name__ == "__main__":
         "BUFFER_SIZE": 1000000,
         "BATCH_SIZE": 32,  # N = C/batch_size in psueudocode
         "BATCH_LENGTH": 20,
+        "SYMLOG_CRITIC_TARGETS": True,
     }
     rng = jax.random.PRNGKey(30)
     train_jit = jax.jit(make_train(config))
