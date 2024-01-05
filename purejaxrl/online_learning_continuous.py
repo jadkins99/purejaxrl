@@ -11,6 +11,7 @@ import distrax
 import os
 import gymnax
 import flashbax as fbx
+from jax.nn.initializers import variance_scaling
 from wrappers import (
     LogWrapper,
     BraxGymnaxWrapper,
@@ -19,11 +20,14 @@ from wrappers import (
     NormalizeVecReward,
     ClipAction,
 )
+from rlax import transform_to_2hot
+from pathlib import Path
 
 from jax import config
-
+import pickle
 
 # config.update("jax_disable_jit", True)
+# config.update("jax_debug_nans", True)
 
 
 class ActorTrainState(TrainState):
@@ -32,27 +36,52 @@ class ActorTrainState(TrainState):
 
 class Critic(nn.Module):
     activation: str = "tanh"
+    num_bins: int = None
+    bin_min_value: int = -20
+    bin_max_value: int = 20
 
     @nn.compact
     def __call__(self, x):
         if self.activation == "relu":
             activation = nn.relu
+
+        elif self.activation == "silu":
+            activation = nn.silu
+
         else:
             activation = nn.tanh
 
         critic = nn.Dense(
-            256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+            256,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
         )(x)
         critic = activation(critic)
         critic = nn.Dense(
-            256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+            256,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
         )(critic)
         critic = activation(critic)
-        critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
-            critic
-        )
 
-        return jnp.squeeze(critic, axis=-1)
+        if self.num_bins is None:
+            value = nn.Dense(1, kernel_init=constant(0.0), bias_init=constant(0.0))(
+                critic
+            )
+            return jnp.squeeze(value, axis=-1), 1.0
+
+        else:
+            bin_logits = nn.Dense(
+                self.num_bins, kernel_init=constant(0.0), bias_init=constant(0.0)
+            )(critic)
+            probs = jax.nn.softmax(bin_logits, axis=-1)
+            possible_outcomes = jnp.linspace(
+                self.bin_min_value,
+                self.bin_max_value,
+                self.num_bins,
+            )
+            value = jnp.sum(probs * possible_outcomes, axis=-1)
+            return value, bin_logits
 
 
 class Actor(nn.Module):
@@ -63,21 +92,31 @@ class Actor(nn.Module):
     def __call__(self, x):
         if self.activation == "relu":
             activation = nn.relu
+        elif self.activation == "silu":
+            activation = nn.silu
         else:
             activation = nn.tanh
         actor_rep = nn.Dense(
-            256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+            256,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
         )(x)
         actor_rep = activation(actor_rep)
         actor_rep = nn.Dense(
-            256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+            256,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
         )(actor_rep)
         actor_rep = activation(actor_rep)
         actor_mean = nn.Dense(
-            self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
+            self.action_dim,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
         )(actor_rep)
         actor_logtstd = nn.Dense(
-            self.action_dim, kernel_init=orthogonal(0.0), bias_init=constant(0.0)
+            self.action_dim,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
         )(actor_rep)
         # actor_logtstd = self.param("log_std", nn.initializers.zeros, (self.action_dim,))
         pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logtstd))
@@ -113,7 +152,7 @@ def make_train(config):
     env = VecEnv(env)
     if config["NORMALIZE_ENV"]:
         env = NormalizeVecObservation(env)
-        env = NormalizeVecReward(env, config["GAMMA"])
+        # env = NormalizeVecReward(env, config["GAMMA"])
 
     def linear_schedule(count):
         frac = (
@@ -128,7 +167,12 @@ def make_train(config):
         actor_network = Actor(
             env.action_space(env_params).shape[0], activation=config["ACTIVATION"]
         )
-        critic_network = Critic(activation=config["ACTIVATION"])
+        critic_network = Critic(
+            activation=config["ACTIVATION"],
+            num_bins=config["NUM_BINS"],
+            bin_min_value=config["BIN_MIN_VALUE"],
+            bin_max_value=config["BIN_MAX_VALUE"],
+        )
 
         rng, _rng = jax.random.split(rng)
         init_x = jnp.zeros(env.observation_space(env_params).shape)
@@ -211,7 +255,7 @@ def make_train(config):
             # SELECT ACTION
             rng, _rng = jax.random.split(rng)
             pi = actor_network.apply(actor_train_state.params, last_obs)
-            value = critic_network.apply(critic_train_state.params, last_obs)
+            value, logits = critic_network.apply(critic_train_state.params, last_obs)
 
             if config["SYMLOG_CRITIC_TARGETS"]:
                 value = symexp(value)
@@ -251,7 +295,7 @@ def make_train(config):
         pi = actor_network.apply(actor_train_state.params, d_obs)
         d_action = pi.sample(seed=rng)
         d_log_prob = pi.log_prob(d_action)
-        d_value = critic_network.apply(critic_train_state.params, d_obs)
+        d_value, logits = critic_network.apply(critic_train_state.params, d_obs)
         rng, _rng = jax.random.split(rng)
         step_rng = jax.random.split(_rng, 1)
         d_last_obs, d_env_state, d_reward, d_done, d_info = env.step(
@@ -291,7 +335,7 @@ def make_train(config):
         buffer_state = replay_buffer.add(buffer_state, traj_batch_buffer)
 
         last_obs = traj_batch.last_obs[-1, ...]
-        last_val = critic_network.apply(critic_train_state.params, last_obs)
+        last_val, logits = critic_network.apply(critic_train_state.params, last_obs)
         if config["SYMLOG_CRITIC_TARGETS"]:
             last_val = symexp(last_val)
 
@@ -325,11 +369,11 @@ def make_train(config):
             sampled_batch = replay_buffer.sample(buffer_state, _rng)
             sampled_batch = jax.tree_util.tree_map(swap_axis, sampled_batch)
             last_obs_buffer = sampled_batch.experience.last_obs[-1, ...]
-            last_val_buffer = critic_network.apply(
+            last_val_buffer, logits = critic_network.apply(
                 critic_train_state.params, last_obs_buffer
             )
 
-            last_val = critic_network.apply(critic_train_state.params, last_obs)
+            last_val, logits = critic_network.apply(critic_train_state.params, last_obs)
 
             if config["SYMLOG_CRITIC_TARGETS"]:
                 last_val_buffer = symexp(last_val_buffer)
@@ -342,13 +386,13 @@ def make_train(config):
             )
             advantages_recent, _ = _calculate_gae(traj_batch, last_val)
             # COMPUTE ADVANTAGE STATISTICS
-            actor_train_state.advn_stats["advn_per_5"] = (
+            (
                 config["ADVANTAGE_EMA_RATE"] * jnp.percentile(advantages_recent, 5)
                 + (1 - config["ADVANTAGE_EMA_RATE"])
                 * actor_train_state.advn_stats["advn_per_5"]
             )
-            actor_train_state.advn_stats["advn_per_95"] = (
-                config["ADVANTAGE_EMA_RATE"] * jnp.percentile(advantages_recent, 5)
+            (
+                config["ADVANTAGE_EMA_RATE"] * jnp.percentile(advantages_recent, 95)
                 + (1 - config["ADVANTAGE_EMA_RATE"])
                 * actor_train_state.advn_stats["advn_per_95"]
             )
@@ -363,15 +407,34 @@ def make_train(config):
                         if config["SYMLOG_CRITIC_TARGETS"]:
                             targets = symlog(targets)
                         # RERUN NETWORK
-                        value = critic_network.apply(critic_params, traj_batch.obs)
+                        value, logits = critic_network.apply(
+                            critic_params, traj_batch.obs
+                        )
 
                         # CALCULATE VALUE LOSS
                         # value_pred_clipped = traj_batch.value + (
                         #     value - traj_batch.value
                         # ).clip(-config["CLIP_EPS"], config["CLIP_EPS"])
-                        value_losses = jnp.square(
-                            value - jax.lax.stop_gradient(targets)
-                        )
+
+                        if config["NUM_BINS"] is None:
+                            value_losses = jnp.square(
+                                value - jax.lax.stop_gradient(targets)
+                            )
+
+                        else:
+                            critic_target_2hot = transform_to_2hot(
+                                targets,
+                                min_value=config["BIN_MIN_VALUE"],
+                                max_value=config["BIN_MAX_VALUE"],
+                                num_bins=config["NUM_BINS"],
+                            )
+                            value_losses = -1 * jnp.sum(
+                                jnp.multiply(logits, critic_target_2hot), axis=-1
+                            )
+                        # sum_value_loss_two_hot_B = jnp.sum(
+                        #     value_loss_two_hot_B_H, axis=1
+                        # )
+
                         # value_losses_clipped = jnp.square(value_pred_clipped - targets)
                         # value_loss = (
                         #     0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
@@ -389,11 +452,13 @@ def make_train(config):
                         # CALCULATE ACTOR LOSS
                         # ratio = jnp.exp(log_prob - traj_batch.log_prob)
                         if config["ADVN_NORM"] == "MEAN":
-                            gae = (gae - gae.mean()) / (gae.std() + 1e-8)
+                            gae = (gae - gae.mean()) / (gae.std() + 1e-6)
 
                         elif config["ADVN_NORM"] == "EMA":
                             gae = gae / (
-                                advn_stats["advn_per_95"] - advn_stats["advn_per_5"]
+                                advn_stats["advn_per_95"]
+                                - advn_stats["advn_per_5"]
+                                + 1e-6
                             )
 
                         elif config["ADVN_NORM"] == "MAX_EMA":
@@ -558,38 +623,132 @@ def make_train(config):
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Process some integers.")
+    parser.add_argument(
+        "--alg_type",
+        action="store",
+        default="lambda_ac",
+    )
+    parser.add_argument(
+        "--env_name",
+        action="store",
+        default="hopper",
+    )
+    parser.add_argument(
+        "--sweep",
+        action="store_true",
+        default=False,
+    )
+    args = parser.parse_args()
     config = {
         "ACTOR_LR": 3e-4,
         "CRITIC_LR": 3e-4,
-        "NUM_ENVS": 2048,
-        "NUM_STEPS": 10,  # T = num_steps*num_envs
+        "NUM_ENVS": 8,
+        "NUM_STEPS": 1,  # T = num_steps*num_envs
         "TOTAL_TIMESTEPS": 5e5,  # Z in pseudocode
-        "UPDATE_EPOCHS": 4,  # E in pseudocode
-        "NUM_MINIBATCHES": 32,  # M in pseudocode
+        "UPDATE_EPOCHS": 1,  # E in pseudocode
+        "NUM_MINIBATCHES": 1,  # M in pseudocode
         "ADVANTAGE_EMA_RATE": 0.02,
-        "ADVN_NORM": "Off",
+        "ADVN_NORM": "OFF",
         "GAMMA": 0.99,
         "GAE_LAMBDA": 0.95,
         "ENT_COEF": 0.1,
-        "VF_COEF": 0.5,
         "MAX_GRAD_NORM": 0.5,
         "ACTIVATION": "tanh",
-        "ENV_NAME": "hopper",
+        "ENV_NAME": args.env_name,
         "ANNEAL_LR": False,
-        "NORMALIZE_ENV": True,
+        "NORMALIZE_ENV": False,
         "DEBUG": True,
         "BUFFER_MIN_LENGTH_TIME_AXIS": 100,
         "BUFFER_SIZE": 1000000,
         "BATCH_SIZE": 32,  # N = C/batch_size in psueudocode
         "BATCH_LENGTH": 20,
-        "SYMLOG_CRITIC_TARGETS": True,
+        "SYMLOG_CRITIC_TARGETS": False,
+        "NUM_BINS": None,
+        "BIN_MIN_VALUE": -20,
+        "BIN_MAX_VALUE": 20,
+        "SWEEP": False,
     }
-    rng = jax.random.PRNGKey(30)
-    train_jit = jax.jit(make_train(config))
-    out = train_jit(rng)
-    import matplotlib.pyplot as plt
 
-    plt.plot(out["metrics"]["returned_episode_returns"].mean(-1).reshape(-1))
-    plt.xlabel("Update Step")
-    plt.ylabel("Return")
-    plt.show()
+    if args.alg_type == "advn_norm_ema":
+        config["ADVN_NORM"] = "EMA"
+    elif args.alg_type == "advn_norm_max_ema":
+        config["ADVN_NORM"] = "MAX_EMA"
+    elif args.alg_type == "advn_norm_mean":
+        config["ADVN_NORM"] = "MEAN"
+    elif args.alg_type == "symlog_critic_targets":
+        config["SYMLOG_CRITIC_TARGETS"] = True
+    elif args.alg_type == "discrete_critic":
+        config["SYMLOG_CRITIC_TARGETS"] = True
+        config["NUM_BINS"] = 255
+
+    rng = jax.random.PRNGKey(30)
+    num_seeds = 10
+
+    import sqlite3
+
+    if config["SWEEP"]:
+        dbase = sqlite3.connect("SweepDatabase.db")
+        q = dbase.execute("SELECT * FROM sweep_runs WHERE mean_episode_return is NULL")
+        qs = q.fetchall()
+
+        # we only want to run jobs of varying hyperparam config with fixed env and alg type
+        filtered_qs = list(
+            filter(
+                lambda setting: setting[0] == args.env_name
+                and setting[1] == args.alg_type,
+                qs,
+            )
+        )
+
+        sweep_vals = list(map(lambda setting: setting[2:6], filtered_qs))
+        sweep_vals = jnp.asarray(sweep_vals)
+
+        rngs = jax.random.split(rng, num_seeds)
+
+        train_vjit = jax.jit(
+            jax.vmap(jax.vmap(make_train(config), in_axes=(0, None)), in_axes=(None, 0))
+        )
+        outs = train_vjit(rngs, sweep_vals)
+
+        path_str = (
+            f"/Users/jadkins/purejaxrl/jax_rl_logs/{args.alg_type}/{args.env_name}"
+        )
+        path_str = f"/home/jadkins/scratch/purejaxrl/jax_rl_logs/{args.alg_type}/{args.env_name}"
+
+        Path(path_str).mkdir(parents=True, exist_ok=True)
+
+        with open(
+            f"{path_str}/GAE_LAMBDA={sweep_vals[:][0]}_CRITIC_LR={sweep_vals[:][1]}_ACTOR_LR={sweep_vals[:][2]}_ENT_COEF={sweep_vals[:][3]}RNG={start_seed},{num_seeds}.pkl",
+            "wb",
+        ) as f:
+            pickle.dump(outs["metrics"], f)
+
+        for sweep_params in range(sweep_vals.shape[0]):
+            for seed_idx in range(0, num_seeds):
+                completed_episodes = outs["metrics"]["returned_episode"][sweep_params][
+                    seed_idx
+                ]
+                returns_completed_episodes = outs["metrics"][
+                    "returned_episode_returns"
+                ][sweep_params][seed_idx][completed_episodes == True]
+                returned_episode_mean = returns_completed_episodes.mean()
+                dbase.execute(
+                    f"INSERT INTO sweep_runs(env_name,alg_type,gae_lambda,critic_lr,actor_lr,ent_coef, seed_idx, T, mean_episode_return) VALUES('{args.env_name}', '{args.alg_type}',{sweep_vals[sweep_params][0]},{sweep_vals[sweep_params][1]},{sweep_vals[sweep_params][2]},{sweep_vals[sweep_params][3]},{seed_idx},{config['NUM_STEPS']*config['NUM_ENVS']},{returned_episode_mean});"
+                )
+        dbase.commit()
+
+        dbase.close()
+
+    else:
+        train_jit = jax.jit(make_train(config))
+
+        out = train_jit(rng)
+        import matplotlib.pyplot as plt
+
+        plt.plot(out["metrics"]["returned_episode_returns"].mean(-1).reshape(-1))
+        plt.xlabel("Update Step")
+        plt.ylabel("Return")
+        plt.show()
