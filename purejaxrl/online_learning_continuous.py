@@ -20,14 +20,35 @@ from wrappers import (
     NormalizeVecReward,
     ClipAction,
 )
-from rlax import transform_to_2hot
+#from rlax import transform_to_2hot
 from pathlib import Path
 
 from jax import config
 import pickle
+import chex
 
 # config.update("jax_disable_jit", True)
 # config.update("jax_debug_nans", True)
+Array = chex.Array
+def transform_to_2hot(
+    scalar: Array,
+    min_value: float,
+    max_value: float,
+    num_bins: int) -> Array:
+  """Transforms a scalar tensor to a 2 hot representation."""
+  scalar = jnp.clip(scalar, min_value, max_value)
+  scalar_bin = (scalar - min_value) / (max_value - min_value) * (num_bins - 1)
+  lower, upper = jnp.floor(scalar_bin), jnp.ceil(scalar_bin)
+  lower_value = (lower / (num_bins - 1.0)) * (max_value - min_value) + min_value
+  upper_value = (upper / (num_bins - 1.0)) * (max_value - min_value) + min_value
+  p_lower = (upper_value - scalar) / (upper_value - lower_value + 1e-5)
+  p_upper = 1 - p_lower
+  lower_one_hot = base.one_hot(
+      lower, num_bins, dtype=scalar.dtype) * jnp.expand_dims(p_lower, -1)
+  upper_one_hot = base.one_hot(
+      upper, num_bins, dtype=scalar.dtype) * jnp.expand_dims(p_upper, -1)
+  return lower_one_hot + upper_one_hot
+
 
 
 class ActorTrainState(TrainState):
@@ -162,7 +183,14 @@ def make_train(config):
         )
         return config["LR"] * frac
 
-    def train(rng):
+    def train(rng,sweep_vals):
+        # lives in []
+        GAE_LAMBDA = sweep_vals[0]
+        # lives in [10^-5,10^-4,10^-3,10^-2,10^-1]
+        CRITIC_LR = sweep_vals[1]
+
+        ACTOR_LR = sweep_vals[2]
+        ENT_COEF = sweep_vals[3]
         # INIT NETWORK
         actor_network = Actor(
             env.action_space(env_params).shape[0], activation=config["ACTIVATION"]
@@ -645,8 +673,8 @@ if __name__ == "__main__":
     config = {
         "ACTOR_LR": 3e-4,
         "CRITIC_LR": 3e-4,
-        "NUM_ENVS": 8,
-        "NUM_STEPS": 1,  # T = num_steps*num_envs
+        "NUM_ENVS": 2048,
+        "NUM_STEPS": 10,  # T = num_steps*num_envs
         "TOTAL_TIMESTEPS": 5e5,  # Z in pseudocode
         "UPDATE_EPOCHS": 1,  # E in pseudocode
         "NUM_MINIBATCHES": 1,  # M in pseudocode
@@ -669,7 +697,7 @@ if __name__ == "__main__":
         "NUM_BINS": None,
         "BIN_MIN_VALUE": -20,
         "BIN_MAX_VALUE": 20,
-        "SWEEP": False,
+        "SWEEP": args.sweep,
     }
 
     if args.alg_type == "advn_norm_ema":
@@ -684,68 +712,79 @@ if __name__ == "__main__":
         config["SYMLOG_CRITIC_TARGETS"] = True
         config["NUM_BINS"] = 255
 
-    rng = jax.random.PRNGKey(30)
-    num_seeds = 10
+    start_seed=30
+    rng = jax.random.PRNGKey(start_seed)
+    num_seeds = 30
 
     import sqlite3
 
     if config["SWEEP"]:
-        dbase = sqlite3.connect("SweepDatabase.db")
-        q = dbase.execute("SELECT * FROM sweep_runs WHERE mean_episode_return is NULL")
-        qs = q.fetchall()
+        num_params = 2
+        while True:
+            dbase = sqlite3.connect("/home/jadkins/scratch/SweepDatabase.db")
+            q = dbase.execute(f"""SELECT rowid,* FROM sweep_runs WHERE
+                              mean_episode_return is NULL AND env_name =
+                              '{args.env_name}' AND alg_type =
+                              '{args.alg_type}'
+                              LIMIT {num_params} """)
+            qs = q.fetchall()
 
-        # we only want to run jobs of varying hyperparam config with fixed env and alg type
-        filtered_qs = list(
-            filter(
-                lambda setting: setting[0] == args.env_name
-                and setting[1] == args.alg_type,
-                qs,
-            )
-        )
-
-        sweep_vals = list(map(lambda setting: setting[2:6], filtered_qs))
-        sweep_vals = jnp.asarray(sweep_vals)
-
-        rngs = jax.random.split(rng, num_seeds)
-
-        train_vjit = jax.jit(
-            jax.vmap(jax.vmap(make_train(config), in_axes=(0, None)), in_axes=(None, 0))
-        )
-        outs = train_vjit(rngs, sweep_vals)
-
-        path_str = (
-            f"/Users/jadkins/purejaxrl/jax_rl_logs/{args.alg_type}/{args.env_name}"
-        )
-        path_str = f"/home/jadkins/scratch/purejaxrl/jax_rl_logs/{args.alg_type}/{args.env_name}"
-
-        Path(path_str).mkdir(parents=True, exist_ok=True)
-
-        with open(
-            f"{path_str}/GAE_LAMBDA={sweep_vals[:][0]}_CRITIC_LR={sweep_vals[:][1]}_ACTOR_LR={sweep_vals[:][2]}_ENT_COEF={sweep_vals[:][3]}RNG={start_seed},{num_seeds}.pkl",
-            "wb",
-        ) as f:
-            pickle.dump(outs["metrics"], f)
-
-        for sweep_params in range(sweep_vals.shape[0]):
-            for seed_idx in range(0, num_seeds):
-                completed_episodes = outs["metrics"]["returned_episode"][sweep_params][
-                    seed_idx
-                ]
-                returns_completed_episodes = outs["metrics"][
-                    "returned_episode_returns"
-                ][sweep_params][seed_idx][completed_episodes == True]
-                returned_episode_mean = returns_completed_episodes.mean()
-                dbase.execute(
-                    f"INSERT INTO sweep_runs(env_name,alg_type,gae_lambda,critic_lr,actor_lr,ent_coef, seed_idx, T, mean_episode_return) VALUES('{args.env_name}', '{args.alg_type}',{sweep_vals[sweep_params][0]},{sweep_vals[sweep_params][1]},{sweep_vals[sweep_params][2]},{sweep_vals[sweep_params][3]},{seed_idx},{config['NUM_STEPS']*config['NUM_ENVS']},{returned_episode_mean});"
+            row_ids = list(map(lambda setting: setting[0],qs))
+            sweep_vals = list(map(lambda setting: setting[3:7],qs))
+            # we only want to run jobs of varying hyperparam config with fixed env and alg type
+            '''filtered_qs = list(
+                filter(
+                    lambda setting: setting[1] == args.env_name
+                    and setting[2] == args.alg_type,
+                    qs,
                 )
-        dbase.commit()
+            )
+            '''
+            sweep_vals = jnp.asarray(sweep_vals)
 
-        dbase.close()
+            #sweep_vals = sweep_vals[:num_params,...]
+            rngs = jax.random.split(rng, num_seeds)
+
+            train_vjit = jax.jit(
+                jax.vmap(jax.vmap(make_train(config), in_axes=(0, None)), in_axes=(None, 0))
+            )
+            outs = train_vjit(rngs, sweep_vals)
+
+            #path_str = (
+            #    f"/Users/jadkins/purejaxrl/jax_rl_logs/{args.alg_type}/{args.env_name}"
+            #)
+            path_str = f"/home/jadkins/scratch/jax_rl_logs/{args.alg_type}/{args.env_name}"
+
+            Path(path_str).mkdir(parents=True, exist_ok=True)
+
+            with open(
+                f"{path_str}/params={sweep_vals[0]},sweep_vals[1]_RNG={start_seed},{num_seeds}.pkl",
+                "wb",
+            ) as f:
+                pickle.dump(outs["metrics"], f)
+
+            for row_id in row_ids:
+                dbase.execute(f"DELETE FROM sweep_runs WHERE rowid={row_id};")
+            for sweep_params in range(sweep_vals.shape[0]):
+                for seed_idx in range(0, num_seeds):
+                    completed_episodes = outs["metrics"]["returned_episode"][sweep_params][
+                        seed_idx
+                    ]
+                    returns_completed_episodes = outs["metrics"][
+                        "returned_episode_returns"
+                    ][sweep_params][seed_idx][completed_episodes == True]
+                    returned_episode_mean = returns_completed_episodes.mean()
+                    dbase.execute(
+                        f"INSERT INTO sweep_runs(env_name,alg_type,gae_lambda,critic_lr,actor_lr,ent_coef, seed_idx, T, mean_episode_return) VALUES('{args.env_name}', '{args.alg_type}',{sweep_vals[sweep_params][0]},{sweep_vals[sweep_params][1]},{sweep_vals[sweep_params][2]},{sweep_vals[sweep_params][3]},{seed_idx},{config['NUM_STEPS']*config['NUM_ENVS']},{returned_episode_mean});"
+                    )
+            dbase.commit()
+
+            dbase.close()
 
     else:
         train_jit = jax.jit(make_train(config))
 
-        out = train_jit(rng)
+        out = train_jit(rng,jnp.array([0.95, 2.5e-3, 2.5e-4, 0.01]))
         import matplotlib.pyplot as plt
 
         plt.plot(out["metrics"]["returned_episode_returns"].mean(-1).reshape(-1))
