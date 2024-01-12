@@ -20,35 +20,39 @@ from wrappers import (
     NormalizeVecReward,
     ClipAction,
 )
-#from rlax import transform_to_2hot
+from env_params import *
+
+from rlax import transform_to_2hot
 from pathlib import Path
 
 from jax import config
 import pickle
 import chex
+from env_params import *
 
 # config.update("jax_disable_jit", True)
 # config.update("jax_debug_nans", True)
 Array = chex.Array
-def transform_to_2hot(
-    scalar: Array,
-    min_value: float,
-    max_value: float,
-    num_bins: int) -> Array:
-  """Transforms a scalar tensor to a 2 hot representation."""
-  scalar = jnp.clip(scalar, min_value, max_value)
-  scalar_bin = (scalar - min_value) / (max_value - min_value) * (num_bins - 1)
-  lower, upper = jnp.floor(scalar_bin), jnp.ceil(scalar_bin)
-  lower_value = (lower / (num_bins - 1.0)) * (max_value - min_value) + min_value
-  upper_value = (upper / (num_bins - 1.0)) * (max_value - min_value) + min_value
-  p_lower = (upper_value - scalar) / (upper_value - lower_value + 1e-5)
-  p_upper = 1 - p_lower
-  lower_one_hot = base.one_hot(
-      lower, num_bins, dtype=scalar.dtype) * jnp.expand_dims(p_lower, -1)
-  upper_one_hot = base.one_hot(
-      upper, num_bins, dtype=scalar.dtype) * jnp.expand_dims(p_upper, -1)
-  return lower_one_hot + upper_one_hot
 
+
+# def transform_to_2hot(
+#     scalar: Array, min_value: float, max_value: float, num_bins: int
+# ) -> Array:
+#     """Transforms a scalar tensor to a 2 hot representation."""
+#     scalar = jnp.clip(scalar, min_value, max_value)
+#     scalar_bin = (scalar - min_value) / (max_value - min_value) * (num_bins - 1)
+#     lower, upper = jnp.floor(scalar_bin), jnp.ceil(scalar_bin)
+#     lower_value = (lower / (num_bins - 1.0)) * (max_value - min_value) + min_value
+#     upper_value = (upper / (num_bins - 1.0)) * (max_value - min_value) + min_value
+#     p_lower = (upper_value - scalar) / (upper_value - lower_value + 1e-5)
+#     p_upper = 1 - p_lower
+#     lower_one_hot = base.one_hot(lower, num_bins, dtype=scalar.dtype) * jnp.expand_dims(
+#         p_lower, -1
+#     )
+#     upper_one_hot = base.one_hot(upper, num_bins, dtype=scalar.dtype) * jnp.expand_dims(
+#         p_upper, -1
+#     )
+#     return lower_one_hot + upper_one_hot
 
 
 class ActorTrainState(TrainState):
@@ -131,12 +135,12 @@ class Actor(nn.Module):
         actor_rep = activation(actor_rep)
         actor_mean = nn.Dense(
             self.action_dim,
-            kernel_init=orthogonal(np.sqrt(2)),
+            kernel_init=orthogonal(np.sqrt(0.01)),
             bias_init=constant(0.0),
         )(actor_rep)
         actor_logtstd = nn.Dense(
             self.action_dim,
-            kernel_init=orthogonal(np.sqrt(2)),
+            kernel_init=orthogonal(np.sqrt(0.01)),
             bias_init=constant(0.0),
         )(actor_rep)
         # actor_logtstd = self.param("log_std", nn.initializers.zeros, (self.action_dim,))
@@ -163,9 +167,10 @@ def make_train(config):
     # config["MINIBATCH_SIZE"] = (
     #     config["NUM_ENVS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
     # )
-    if config["ENV_NAME"] == "Pendulum-v1":
-        env, env_params = gymnax.make(config["ENV_NAME"])
 
+    if config["ENV_NAME"] == "Pendulum-v1":
+        env, _ = gymnax.make(config["ENV_NAME"])
+        env_params = PendulumEnvParams()
     else:
         env, env_params = BraxGymnaxWrapper(config["ENV_NAME"]), None
     env = LogWrapper(env)
@@ -183,7 +188,7 @@ def make_train(config):
         )
         return config["LR"] * frac
 
-    def train(rng,sweep_vals):
+    def train(rng, sweep_vals):
         # lives in []
         GAE_LAMBDA = sweep_vals[0]
         # lives in [10^-5,10^-4,10^-3,10^-2,10^-1]
@@ -220,11 +225,11 @@ def make_train(config):
         else:
             actor_tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-                optax.adam(config["ACTOR_LR"], eps=1e-5),
+                optax.adam(ACTOR_LR, eps=1e-5),
             )
             critic_tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-                optax.adam(config["CRITIC_LR"], eps=1e-5),
+                optax.adam(CRITIC_LR, eps=1e-5),
             )
         actor_train_state = ActorTrainState.create(
             apply_fn=actor_network.apply,
@@ -258,7 +263,7 @@ def make_train(config):
                     transition.reward,
                 )
                 delta = reward + config["GAMMA"] * next_value * (1 - done) - value
-                gae = delta + config["GAMMA"] * config["GAE_LAMBDA"] * (1 - done) * gae
+                gae = delta + config["GAMMA"] * GAE_LAMBDA * (1 - done) * gae
                 return (gae, value), gae
 
             _, advantages = jax.lax.scan(
@@ -506,12 +511,12 @@ def make_train(config):
                         #     )
                         #     * gae
                         # )
-                        loss_actor = log_prob * jax.lax.stop_gradient(gae)
+                        loss_actor = -1.0 * log_prob * jax.lax.stop_gradient(gae)
                         # loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
                         loss_actor = loss_actor.mean()
                         entropy = pi.entropy().mean()
 
-                        total_loss = loss_actor - config["ENT_COEF"] * entropy
+                        total_loss = loss_actor - ENT_COEF * entropy
 
                         return total_loss, (loss_actor, entropy)
 
@@ -671,18 +676,14 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     config = {
-        "ACTOR_LR": 3e-4,
-        "CRITIC_LR": 3e-4,
-        "NUM_ENVS": 2048,
+        "NUM_ENVS": 4,
         "NUM_STEPS": 10,  # T = num_steps*num_envs
-        "TOTAL_TIMESTEPS": 5e5,  # Z in pseudocode
-        "UPDATE_EPOCHS": 1,  # E in pseudocode
+        "TOTAL_TIMESTEPS": 5e6,  # Z in pseudocode
+        "UPDATE_EPOCHS": 4,  # E in pseudocode
         "NUM_MINIBATCHES": 1,  # M in pseudocode
         "ADVANTAGE_EMA_RATE": 0.02,
         "ADVN_NORM": "OFF",
         "GAMMA": 0.99,
-        "GAE_LAMBDA": 0.95,
-        "ENT_COEF": 0.1,
         "MAX_GRAD_NORM": 0.5,
         "ACTIVATION": "tanh",
         "ENV_NAME": args.env_name,
@@ -712,7 +713,7 @@ if __name__ == "__main__":
         config["SYMLOG_CRITIC_TARGETS"] = True
         config["NUM_BINS"] = 255
 
-    start_seed=30
+    start_seed = 43
     rng = jax.random.PRNGKey(start_seed)
     num_seeds = 30
 
@@ -722,43 +723,41 @@ if __name__ == "__main__":
         num_params = 2
         while True:
             dbase = sqlite3.connect("/home/jadkins/scratch/SweepDatabase.db")
-            q = dbase.execute(f"""SELECT rowid,* FROM sweep_runs WHERE
+            q = dbase.execute(
+                f"""SELECT rowid,* FROM sweep_runs WHERE
                               mean_episode_return is NULL AND env_name =
                               '{args.env_name}' AND alg_type =
                               '{args.alg_type}'
-                              LIMIT {num_params} """)
+                              LIMIT {num_params} """
+            )
             qs = q.fetchall()
 
-            row_ids = list(map(lambda setting: setting[0],qs))
-            sweep_vals = list(map(lambda setting: setting[3:7],qs))
+            row_ids = list(map(lambda setting: setting[0], qs))
+            sweep_vals = list(map(lambda setting: setting[3:7], qs))
             # we only want to run jobs of varying hyperparam config with fixed env and alg type
-            '''filtered_qs = list(
-                filter(
-                    lambda setting: setting[1] == args.env_name
-                    and setting[2] == args.alg_type,
-                    qs,
-                )
-            )
-            '''
+
             sweep_vals = jnp.asarray(sweep_vals)
 
-            #sweep_vals = sweep_vals[:num_params,...]
             rngs = jax.random.split(rng, num_seeds)
 
             train_vjit = jax.jit(
-                jax.vmap(jax.vmap(make_train(config), in_axes=(0, None)), in_axes=(None, 0))
+                jax.vmap(
+                    jax.vmap(make_train(config), in_axes=(0, None)), in_axes=(None, 0)
+                )
             )
             outs = train_vjit(rngs, sweep_vals)
 
-            #path_str = (
-            #    f"/Users/jadkins/purejaxrl/jax_rl_logs/{args.alg_type}/{args.env_name}"
-            #)
-            path_str = f"/home/jadkins/scratch/jax_rl_logs/{args.alg_type}/{args.env_name}"
+            path_str = (
+                f"/Users/jadkins/purejaxrl/jax_rl_logs/{args.alg_type}/{args.env_name}"
+            )
+            # path_str = (
+            #     f"/home/jadkins/scratch/jax_rl_logs/{args.alg_type}/{args.env_name}"
+            # )
 
             Path(path_str).mkdir(parents=True, exist_ok=True)
 
             with open(
-                f"{path_str}/params={sweep_vals[0]},sweep_vals[1]_RNG={start_seed},{num_seeds}.pkl",
+                f"{path_str}/params={sweep_vals[0]},{sweep_vals[1]}_RNG={start_seed},{num_seeds}.pkl",
                 "wb",
             ) as f:
                 pickle.dump(outs["metrics"], f)
@@ -767,9 +766,9 @@ if __name__ == "__main__":
                 dbase.execute(f"DELETE FROM sweep_runs WHERE rowid={row_id};")
             for sweep_params in range(sweep_vals.shape[0]):
                 for seed_idx in range(0, num_seeds):
-                    completed_episodes = outs["metrics"]["returned_episode"][sweep_params][
-                        seed_idx
-                    ]
+                    completed_episodes = outs["metrics"]["returned_episode"][
+                        sweep_params
+                    ][seed_idx]
                     returns_completed_episodes = outs["metrics"][
                         "returned_episode_returns"
                     ][sweep_params][seed_idx][completed_episodes == True]
@@ -784,7 +783,7 @@ if __name__ == "__main__":
     else:
         train_jit = jax.jit(make_train(config))
 
-        out = train_jit(rng,jnp.array([0.95, 2.5e-3, 2.5e-4, 0.01]))
+        out = train_jit(rng, jnp.array([0.95, 3e-4, 3e-4, 0.1]))
         import matplotlib.pyplot as plt
 
         plt.plot(out["metrics"]["returned_episode_returns"].mean(-1).reshape(-1))
