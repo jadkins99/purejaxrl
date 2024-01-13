@@ -22,7 +22,6 @@ from wrappers import (
 )
 from env_params import *
 
-from rlax import transform_to_2hot
 from pathlib import Path
 
 from jax import config
@@ -34,25 +33,42 @@ from env_params import *
 # config.update("jax_debug_nans", True)
 Array = chex.Array
 
-
-# def transform_to_2hot(
-#     scalar: Array, min_value: float, max_value: float, num_bins: int
-# ) -> Array:
-#     """Transforms a scalar tensor to a 2 hot representation."""
-#     scalar = jnp.clip(scalar, min_value, max_value)
-#     scalar_bin = (scalar - min_value) / (max_value - min_value) * (num_bins - 1)
-#     lower, upper = jnp.floor(scalar_bin), jnp.ceil(scalar_bin)
-#     lower_value = (lower / (num_bins - 1.0)) * (max_value - min_value) + min_value
-#     upper_value = (upper / (num_bins - 1.0)) * (max_value - min_value) + min_value
-#     p_lower = (upper_value - scalar) / (upper_value - lower_value + 1e-5)
-#     p_upper = 1 - p_lower
-#     lower_one_hot = base.one_hot(lower, num_bins, dtype=scalar.dtype) * jnp.expand_dims(
-#         p_lower, -1
-#     )
-#     upper_one_hot = base.one_hot(upper, num_bins, dtype=scalar.dtype) * jnp.expand_dims(
-#         p_upper, -1
-#     )
-#     return lower_one_hot + upper_one_hot
+def one_hot(indices, num_classes, dtype=jnp.float32):
+      """Returns a one-hot version of indices.
+  
+      Args:
+        indices: A tensor of indices.
+        num_classes: Number of classes in the one-hot dimension.
+        dtype: The dtype.
+  
+      Returns:
+        The one-hot tensor. If indices' shape is [A, B, ...], shape is
+        [A, B, ..., num_classes].
+      """
+      labels = jnp.arange(num_classes)
+      for _ in range(indices.ndim):
+          labels = jnp.expand_dims(labels, axis=0)
+      return jnp.array(indices[..., jnp.newaxis] == labels, dtype=dtype)
+  
+  
+def transform_to_2hot(
+  scalar: Array, min_value: float, max_value: float, num_bins: int
+) -> Array:
+      """Transforms a scalar tensor to a 2 hot representation."""
+      scalar = jnp.clip(scalar, min_value, max_value)
+      scalar_bin = (scalar - min_value) / (max_value - min_value) * (num_bins - 1)
+      lower, upper = jnp.floor(scalar_bin), jnp.ceil(scalar_bin)
+      lower_value = (lower / (num_bins - 1.0)) * (max_value - min_value) + min_value
+      upper_value = (upper / (num_bins - 1.0)) * (max_value - min_value) + min_value
+      p_lower = (upper_value - scalar) / (upper_value - lower_value + 1e-5)
+      p_upper = 1 - p_lower
+      lower_one_hot = one_hot(lower, num_bins, dtype=scalar.dtype) * jnp.expand_dims(
+          p_lower, -1
+      )
+      upper_one_hot = one_hot(upper, num_bins, dtype=scalar.dtype) * jnp.expand_dims(
+          p_upper, -1
+      )
+      return lower_one_hot + upper_one_hot
 
 
 class ActorTrainState(TrainState):
@@ -721,64 +737,63 @@ if __name__ == "__main__":
 
     if config["SWEEP"]:
         num_params = 2
-        while True:
-            dbase = sqlite3.connect("/home/jadkins/scratch/SweepDatabase.db")
-            q = dbase.execute(
-                f"""SELECT rowid,* FROM sweep_runs WHERE
-                              mean_episode_return is NULL AND env_name =
-                              '{args.env_name}' AND alg_type =
-                              '{args.alg_type}'
-                              LIMIT {num_params} """
+        dbase = sqlite3.connect("/home/jadkins/scratch/SweepDatabase.db")
+        q = dbase.execute(
+            f"""SELECT rowid,* FROM sweep_runs WHERE
+                          mean_episode_return is NULL AND env_name =
+                          '{args.env_name}' AND alg_type =
+                          '{args.alg_type}'
+                          LIMIT {num_params} """
+        )
+        qs = q.fetchall()
+
+        row_ids = list(map(lambda setting: setting[0], qs))
+        sweep_vals = list(map(lambda setting: setting[3:7], qs))
+        # we only want to run jobs of varying hyperparam config with fixed env and alg type
+
+        sweep_vals = jnp.asarray(sweep_vals)
+
+        rngs = jax.random.split(rng, num_seeds)
+
+        train_vjit = jax.jit(
+            jax.vmap(
+                jax.vmap(make_train(config), in_axes=(0, None)), in_axes=(None, 0)
             )
-            qs = q.fetchall()
+        )
+        outs = train_vjit(rngs, sweep_vals)
 
-            row_ids = list(map(lambda setting: setting[0], qs))
-            sweep_vals = list(map(lambda setting: setting[3:7], qs))
-            # we only want to run jobs of varying hyperparam config with fixed env and alg type
+        path_str = (
+            f"/Users/jadkins/purejaxrl/jax_rl_logs/{args.alg_type}/{args.env_name}"
+        )
+        # path_str = (
+        #     f"/home/jadkins/scratch/jax_rl_logs/{args.alg_type}/{args.env_name}"
+        # )
 
-            sweep_vals = jnp.asarray(sweep_vals)
+        Path(path_str).mkdir(parents=True, exist_ok=True)
 
-            rngs = jax.random.split(rng, num_seeds)
+        with open(
+            f"{path_str}/params={sweep_vals[0]},{sweep_vals[1]}_RNG={start_seed},{num_seeds}.pkl",
+            "wb",
+        ) as f:
+            pickle.dump(outs["metrics"], f)
 
-            train_vjit = jax.jit(
-                jax.vmap(
-                    jax.vmap(make_train(config), in_axes=(0, None)), in_axes=(None, 0)
+        for row_id in row_ids:
+            dbase.execute(f"DELETE FROM sweep_runs WHERE rowid={row_id};")
+        for sweep_params in range(sweep_vals.shape[0]):
+            for seed_idx in range(0, num_seeds):
+                completed_episodes = outs["metrics"]["returned_episode"][
+                    sweep_params
+                ][seed_idx]
+                returns_completed_episodes = outs["metrics"][
+                    "returned_episode_returns"
+                ][sweep_params][seed_idx][completed_episodes == True]
+                returned_episode_mean = returns_completed_episodes.mean()
+                dbase.execute(
+                    f"INSERT INTO sweep_runs(env_name,alg_type,gae_lambda,critic_lr,actor_lr,ent_coef, seed_idx, T, mean_episode_return) VALUES('{args.env_name}', '{args.alg_type}',{sweep_vals[sweep_params][0]},{sweep_vals[sweep_params][1]},{sweep_vals[sweep_params][2]},{sweep_vals[sweep_params][3]},{seed_idx},{config['NUM_STEPS']*config['NUM_ENVS']},{returned_episode_mean});"
                 )
-            )
-            outs = train_vjit(rngs, sweep_vals)
+        dbase.commit()
 
-            path_str = (
-                f"/Users/jadkins/purejaxrl/jax_rl_logs/{args.alg_type}/{args.env_name}"
-            )
-            # path_str = (
-            #     f"/home/jadkins/scratch/jax_rl_logs/{args.alg_type}/{args.env_name}"
-            # )
-
-            Path(path_str).mkdir(parents=True, exist_ok=True)
-
-            with open(
-                f"{path_str}/params={sweep_vals[0]},{sweep_vals[1]}_RNG={start_seed},{num_seeds}.pkl",
-                "wb",
-            ) as f:
-                pickle.dump(outs["metrics"], f)
-
-            for row_id in row_ids:
-                dbase.execute(f"DELETE FROM sweep_runs WHERE rowid={row_id};")
-            for sweep_params in range(sweep_vals.shape[0]):
-                for seed_idx in range(0, num_seeds):
-                    completed_episodes = outs["metrics"]["returned_episode"][
-                        sweep_params
-                    ][seed_idx]
-                    returns_completed_episodes = outs["metrics"][
-                        "returned_episode_returns"
-                    ][sweep_params][seed_idx][completed_episodes == True]
-                    returned_episode_mean = returns_completed_episodes.mean()
-                    dbase.execute(
-                        f"INSERT INTO sweep_runs(env_name,alg_type,gae_lambda,critic_lr,actor_lr,ent_coef, seed_idx, T, mean_episode_return) VALUES('{args.env_name}', '{args.alg_type}',{sweep_vals[sweep_params][0]},{sweep_vals[sweep_params][1]},{sweep_vals[sweep_params][2]},{sweep_vals[sweep_params][3]},{seed_idx},{config['NUM_STEPS']*config['NUM_ENVS']},{returned_episode_mean});"
-                    )
-            dbase.commit()
-
-            dbase.close()
+        dbase.close()
 
     else:
         train_jit = jax.jit(make_train(config))
