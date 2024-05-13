@@ -44,136 +44,120 @@ def cdf_normalize_scores(df, env_list):
     return merged_df
 
 
-def normalize_scores(df, env_list, env_return_bounds=None):
+def normalize_scores(df):
 
-    # take expectation over the seeds
-    p_bar_a_e_theta = df.groupby(
-        ["alg_type", "env_name", "actor_lr", "critic_lr", "ent_coef", "gae_lambda"]
+    env_return_bounds = {}
+    for env in df.env_name.unique():
+        env_return_bounds[env] = {
+            "max": df.loc[df["env_name"] == env]["mean_episode_return"].max(),
+            "min": df.loc[df["env_name"] == env]["mean_episode_return"].min(),
+        }
+    df["normalized_score"] = df.apply(
+        lambda row: 1
+        - (env_return_bounds[row.env_name]["max"] - row.mean_episode_return)
+        / (
+            env_return_bounds[row.env_name]["max"]
+            - env_return_bounds[row.env_name]["min"]
+        ),
+        axis=1,
+    )
+    df = df.drop("mean_episode_return", axis=1)
+    return df
+
+
+def compute_scores(normalized_df, alg_list):
+
+    score_dict = {}
+    # take expectation over seeds
+    normalized_df_expected = normalized_df.groupby(
+        ["env_name", "alg_type", "actor_lr", "critic_lr", "ent_coef", "gae_lambda"],
+        dropna=True,
     ).mean()
-    p_bar_a_e_theta = p_bar_a_e_theta.reset_index()
-    p_bar_a_e_theta = p_bar_a_e_theta.drop(["seed_idx", "start_seed"], axis=1)
+    normalized_df_expected = normalized_df.reset_index()
+    normalized_df_expected = normalized_df.drop("seed_val", axis=1)
 
-    # we need to seperate dfs to compute env normalized scores
-    df_normalized_scores = []
-    for env in env_list:
-        p_bar_a_e_theta_env = p_bar_a_e_theta.loc[
-            p_bar_a_e_theta["env_name"] == env
-        ].copy()
+    cross_envs_hypers_algs = normalized_df_expected.groupby(
+        ["alg_type", "actor_lr", "critic_lr", "ent_coef", "gae_lambda"],
+        dropna=True,
+    ).mean(numeric_only=True)["normalized_score"]
+    cross_envs_hypers_algs = cross_envs_hypers_algs.reset_index()
 
-        if env_return_bounds is None:
-            _max = p_bar_a_e_theta_env["mean_episode_return"].max()
-            _min = p_bar_a_e_theta_env["mean_episode_return"].min()
+    cross_envs_algs = cross_envs_hypers_algs.groupby(["alg_type"]).max()[
+        "normalized_score"
+    ]
+    cross_envs_algs = cross_envs_algs.reset_index()
 
-        else:
-            _max = env_return_bounds[env]["max"]
-            _min = env_return_bounds[env]["min"]
-
-        p_bar_a_e_theta_env[f"{env} normalized score"] = p_bar_a_e_theta.apply(
-            lambda row: 1 - (_max - row["mean_episode_return"]) / (_max - _min), axis=1
-        )
-        # need to drop these so that columns can agree when we merge
-        p_bar_a_e_theta_env = p_bar_a_e_theta_env.drop(
-            ["env_name", "mean_episode_return"], axis=1
-        )
-
-        df_normalized_scores.append(p_bar_a_e_theta_env)
-
-    merged_df = df_normalized_scores[0]
-    for df in df_normalized_scores[1:]:
-        merged_df = pd.merge(merged_df, df, how="inner")
-
-    merged_df["mean normalized score"] = merged_df[
-        [f"{env} normalized score" for env in env_list]
-    ].mean(axis=1)
-
-    return merged_df
-
-
-def compute_scores(concat_scores, alg_list, env_list, env_return_bounds=None):
+    max_per_env_algs_envs = normalized_df_expected.groupby(
+        ["alg_type", "env_name"]
+    ).max()["normalized_score"]
+    max_per_env_algs_envs = max_per_env_algs_envs.reset_index()
+    max_per_env_algs = max_per_env_algs_envs.groupby(["alg_type"]).mean()[
+        "normalized_score"
+    ]
+    max_per_env_algs = max_per_env_algs.reset_index()
 
     score_dict = {}
     for alg in alg_list:
-        theta_a_star = concat_scores.loc[concat_scores["alg_type"] == alg][
-            "mean normalized score"
-        ].idxmax()
-        env_sensitivity_scores = []
-        env_performance_scores = []
-        for env in env_list:
-            env_sensitivity = (
-                concat_scores.loc[concat_scores["alg_type"] == alg][
-                    f"{env} normalized score"
-                ].max()
-                - concat_scores.loc[concat_scores["alg_type"] == alg][
-                    f"{env} normalized score"
-                ][theta_a_star]
-            )
-            env_performance = concat_scores.loc[concat_scores["alg_type"] == alg][
-                f"{env} normalized score"
-            ].max()
-            env_sensitivity_scores.append(env_sensitivity)
-            env_performance_scores.append(env_performance)
-
-        score_dict[f"{alg} sensitivity"] = sum(env_sensitivity_scores) / len(
-            env_sensitivity_scores
+        score_dict[f"{alg}_performance"] = max_per_env_algs.loc[
+            max_per_env_algs["alg_type"] == alg
+        ]["normalized_score"].item()
+        score_dict[f"{alg}_sensitivity"] = (
+            max_per_env_algs.loc[max_per_env_algs["alg_type"] == alg][
+                "normalized_score"
+            ].item()
+            - cross_envs_algs.loc[cross_envs_algs["alg_type"] == alg][
+                "normalized_score"
+            ].item()
         )
 
-        score_dict[f"{alg} performance"] = sum(env_performance_scores) / len(
-            env_performance_scores
-        )
-
-    # print(pd.DataFrame(score_dict, index=[0]))
     return score_dict
 
 
-def boostrap_scores(df, alg_list, env_list, num_points=100):
+def boostrap_scores(normalized_df, alg_list, num_points=100):
     boostrapped_score_data = pd.DataFrame(
-        columns=[f"{alg} sensitivity" for alg in alg_list]
-        + [f"{alg} performance" for alg in alg_list]
+        columns=[f"{alg}_sensitivity" for alg in alg_list]
+        + [f"{alg}_performance" for alg in alg_list]
     )
 
     # https://en.wikipedia.org/wiki/Pairing_function#Cantor_pairing_function
-    df = df.assign(
-        seed_val=lambda x: 0.5
-        * (x.start_seed + x.seed_idx)
-        * (x.start_seed + x.seed_idx + 1)
-        + x.seed_idx
+    # df = df.assign(
+    #     seed_val=lambda x: 0.5
+    #     * (x.start_seed + x.seed_idx)
+    #     * (x.start_seed + x.seed_idx + 1)
+    #     + x.seed_idx
+    # )
+    # df = df.drop("start_seed", axis=1)
+    # df = df.drop("seed_idx", axis=1)
+
+    sampled_seeds = np.random.choice(
+        normalized_df["seed_val"].unique(),
+        replace=True,
+        size=(num_points, normalized_df["seed_val"].unique().size),
     )
 
-    cdf = False
-    if cdf:
-        df = cdf_normalize_scores(df, env_list)
-    else:
-
-        # compute max and min for each environment
-        env_return_bounds = {}
-        for env in env_list:
-            env_return_bounds[env] = {
-                "max": df.loc[df["env_name"] == env]["mean_episode_return"].max(),
-                "min": df.loc[df["env_name"] == env]["mean_episode_return"].min(),
-            }
-        df = normalize_scores(df, env_list, env_return_bounds=env_return_bounds)
+    import time
 
     for m in range(num_points):
-        import time
-
         st = time.time()
+
         print(f"performing iteration {m}")
-        sampled_seeds = np.random.choice(
-            df["seed_val"].unique(), replace=True, size=df["seed_val"].unique().size
-        )
 
         normalized_boostrapped_dataset = pd.concat(
-            [df.loc[df["seed_val"] == seed] for seed in sampled_seeds], axis="rows"
+            list(
+                map(
+                    lambda seed: normalized_df.loc[normalized_df["seed_val"] == seed],
+                    sampled_seeds[m],
+                )
+            ),
+            axis="rows",
         )
-        et = time.time()
-        print(f"sample and concat time {et-st}")
 
-        print(f"normalize time {et-st}")
-
-        scores = compute_scores(normalized_boostrapped_dataset, alg_list, env_list)
+        scores = compute_scores(normalized_boostrapped_dataset, alg_list)
         boostrapped_score_data = pd.concat(
             [boostrapped_score_data, pd.DataFrame(scores, index=[0])]
         )
+        et = time.time()
+        print(f"compute time {et-st}")
 
     return boostrapped_score_data
 
@@ -546,22 +530,22 @@ def make_boostrap_error_plot(
     ) - boot_strapped_score_dataset.quantile(0.025)
     for alg in alg_list:
         if alg in ["lambda_ac", "norm_obs", "symlog_obs"]:
-            sensitivity_scores["obs"].append((alg, scores[f"{alg} sensitivity"]))
-            performance_scores["obs"].append((alg, scores[f"{alg} performance"]))
-            sensitivity_errors["obs"].append((alg, errors.loc[f"{alg} sensitivity"]))
-            performance_errors["obs"].append((alg, errors.loc[f"{alg} performance"]))
+            sensitivity_scores["obs"].append((alg, scores[f"{alg}_sensitivity"]))
+            performance_scores["obs"].append((alg, scores[f"{alg}_performance"]))
+            sensitivity_errors["obs"].append((alg, errors.loc[f"{alg}_sensitivity"]))
+            performance_errors["obs"].append((alg, errors.loc[f"{alg}_performance"]))
 
         if alg in ["lambda_ac", "advn_norm_ema", "advn_norm_max_ema", "advn_norm_mean"]:
-            sensitivity_scores["advn"].append((alg, scores[f"{alg} sensitivity"]))
-            performance_scores["advn"].append((alg, scores[f"{alg} performance"]))
-            sensitivity_errors["advn"].append((alg, errors.loc[f"{alg} sensitivity"]))
-            performance_errors["advn"].append((alg, errors.loc[f"{alg} performance"]))
+            sensitivity_scores["advn"].append((alg, scores[f"{alg}_sensitivity"]))
+            performance_scores["advn"].append((alg, scores[f"{alg}_performance"]))
+            sensitivity_errors["advn"].append((alg, errors.loc[f"{alg}_sensitivity"]))
+            performance_errors["advn"].append((alg, errors.loc[f"{alg}_performance"]))
 
         if alg in ["lambda_ac", "symlog_critic_targets"]:
-            sensitivity_scores["critic"].append((alg, scores[f"{alg} sensitivity"]))
-            performance_scores["critic"].append((alg, scores[f"{alg} performance"]))
-            sensitivity_errors["critic"].append((alg, errors.loc[f"{alg} sensitivity"]))
-            performance_errors["critic"].append((alg, errors.loc[f"{alg} performance"]))
+            sensitivity_scores["critic"].append((alg, scores[f"{alg}_sensitivity"]))
+            performance_scores["critic"].append((alg, scores[f"{alg}_performance"]))
+            sensitivity_errors["critic"].append((alg, errors.loc[f"{alg}_sensitivity"]))
+            performance_errors["critic"].append((alg, errors.loc[f"{alg}_performance"]))
 
     plt.style.use("_mpl-gallery")
 
@@ -680,6 +664,14 @@ if __name__ == "__main__":
         # df["mean_episode_return"] = np.random.normal(size=df["mean_episode_return"].shape)
         df = df.dropna()
         print("df obtained!")
+        df = df.assign(
+            seed_val=lambda x: 0.5
+            * (x.start_seed + x.seed_idx)
+            * (x.start_seed + x.seed_idx + 1)
+            + x.seed_idx
+        )
+        df = df.drop("start_seed", axis=1)
+        df = df.drop("seed_idx", axis=1)
 
     else:
         conn = psycopg2.connect(
@@ -722,7 +714,7 @@ if __name__ == "__main__":
     # df = df.loc[df["alg_type"].isin(alg_list)]
     # df = df.loc[df["env_name"].isin(env_list)]
 
-    num_points = 10000
+    num_points = 103
     if os.path.exists(f"boot_strapped_score_dataset_{num_points}.pkl"):
         boot_strapped_score_dataset = pkl.load(
             open(f"boot_strapped_score_dataset_{num_points}.pkl", "rb")
@@ -740,10 +732,10 @@ if __name__ == "__main__":
         ) as f:
             pkl.dump(boot_strapped_score_dataset, f)
 
-    concat_scores = normalize_scores(df, env_list=env_list)
+    concat_scores = normalize_scores(df)
     # concat_scores = cdf_normalize_scores(df, env_list=env_list)
 
-    scores = compute_scores(concat_scores, alg_list=alg_list, env_list=env_list)
+    scores = compute_scores(concat_scores, alg_list=alg_list)
 
     # step_plot(concat_scores, alg_list, env_list)
     # best_step_down_plot(
@@ -753,7 +745,7 @@ if __name__ == "__main__":
     make_boostrap_error_plot(
         scores, alg_list, boot_strapped_score_dataset, change_labels=change_labels
     )
-    # import scipy
+    # import scipyf
 
     # for alg in alg_list:
     #     acrobot_ranking = concat_scores[concat_scores["alg_type"] == alg].sort_values(
